@@ -1,0 +1,866 @@
+# Directory-style implementation in a single file.
+# Use the comments "# file: <path>" to split into modules when exporting.
+
+# =============================================================
+# file: calib/configs.py
+# =============================================================
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Optional, Callable, Dict, Any, Tuple, List, Protocol
+import math
+import torch
+
+
+# ------------------- Configs -------------------
+@dataclass
+class DeltaKernelConfig:
+    name: str = "rbf"  # or "matern52"
+    lengthscale: float = 1.0
+    variance: float = 1.0
+    noise: float = 1e-6  # nugget for numerical stability
+
+
+@dataclass
+class PFConfig:
+    num_particles: int = 512
+    resample_ess_ratio: float = 0.5
+    resample_scheme: str = "systematic"  # or "stratified", "multinomial"
+    move_strategy: str = "liu_west"  # or "random_walk", "laplace", "pmcmc", "none"
+    # Liu–West hyperparams
+    liu_west_a: float = 0.98
+    liu_west_h2: Optional[float] = None  # if None, derive from a via h^2 = 1-a^2
+    # Random-walk and Laplace proposal scales
+    random_walk_scale: float = 0.05
+    laplace_alpha: float = 1.0
+    laplace_beta: float = 1e-6
+    pmcmc_steps: int = 2
+
+
+@dataclass
+class BOCPDConfig:
+    hazard: Callable[[torch.Tensor], torch.Tensor] = lambda r: 1.0 / (1.0 + r)  # h(r)
+    max_experts: int = 5  # keep top-k experts
+    max_run_length: int = 512  # truncation for run-length posterior (advisory)
+    restart_threshold: float = 0.8  # if P(CP) > threshold, trigger reset policy
+    log_space: bool = True
+
+
+@dataclass
+class ModelConfig:
+    rho: float = 1.0
+    sigma_eps: float = 0.05
+    delta_kernel: DeltaKernelConfig = field(default_factory=DeltaKernelConfig)
+    emulator_type: str = "deterministic"  # or "gp"
+    device: str = "cpu"
+    dtype: torch.dtype = torch.float64
+
+
+@dataclass
+class CalibrationConfig:
+    model: ModelConfig = field(default_factory=ModelConfig)
+    pf: PFConfig = field(default_factory=PFConfig)
+    bocpd: BOCPDConfig = field(default_factory=BOCPDConfig)
+
+
+# =============================================================
+# file: calib/kernels.py
+# =============================================================
+class Kernel(Protocol):
+    def cov(self, X: torch.Tensor, Z: torch.Tensor) -> torch.Tensor: ...
+    def diag(self, X: torch.Tensor) -> torch.Tensor: ...
+
+
+class RBFKernel:
+    def __init__(self, lengthscale: float = 1.0, variance: float = 1.0):
+        self.lengthscale = float(lengthscale)
+        self.variance = float(variance)
+
+    def _d2(self, X: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
+        X2 = (X**2).sum(-1, keepdim=True)
+        Z2 = (Z**2).sum(-1, keepdim=True).transpose(0, 1)
+        return (X2 + Z2 - 2.0 * X @ Z.transpose(0, 1)).clamp_min(0.0)
+
+    def cov(self, X: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
+        d2 = self._d2(X, Z) / (self.lengthscale**2)
+        return torch.exp(-0.5 * d2) * self.variance
+
+    def diag(self, X: torch.Tensor) -> torch.Tensor:
+        return torch.full((X.shape[0],), fill_value=self.variance, dtype=X.dtype, device=X.device)
+
+
+class Matern52Kernel:
+    def __init__(self, lengthscale: float = 1.0, variance: float = 1.0):
+        self.lengthscale = float(lengthscale)
+        self.variance = float(variance)
+
+    def _r(self, X: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
+        X2 = (X**2).sum(-1, keepdim=True)
+        Z2 = (Z**2).sum(-1, keepdim=True).transpose(0, 1)
+        d2 = (X2 + Z2 - 2.0 * X @ Z.transpose(0, 1)).clamp_min(0.0)
+        return torch.sqrt(d2 + 1e-12) / self.lengthscale
+
+    def cov(self, X: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
+        r = self._r(X, Z)
+        s = math.sqrt(5.0) * r
+        return self.variance * (1.0 + s + (5.0/3.0) * r**2) * torch.exp(-s)
+
+    def diag(self, X: torch.Tensor) -> torch.Tensor:
+        return torch.full((X.shape[0],), fill_value=self.variance, dtype=X.dtype, device=X.device)
+
+
+def make_kernel(cfg: DeltaKernelConfig) -> Kernel:
+    if cfg.name.lower() in ("rbf", "se", "sqexp"):
+        return RBFKernel(cfg.lengthscale, cfg.variance)
+    if cfg.name.lower() in ("matern52", "m52"):
+        return Matern52Kernel(cfg.lengthscale, cfg.variance)
+    raise ValueError(f"Unknown kernel: {cfg.name}")
+
+
+# =============================================================
+# file: calib/delta_gp.py
+# =============================================================
+from dataclasses import dataclass, field
+from typing import Any, Dict, Tuple, Literal, Optional
+import torch
+from .kernels import Kernel
+from .likelihood import normal_logpdf
+
+
+@dataclass
+class OnlineGPState:
+    """Online GP state for the discrepancy δ(x) with pluggable update strategies.
+
+    Supports three update modes:
+      - 'exact_full': rebuild full K and its Cholesky each append (O(t^3))
+      - 'exact_rank1': rank-1 Cholesky append using previous factor (O(t^2))
+      - 'sparse_inducing': placeholder for SVGP/FITC-style inducing points (O(t M^2))
+
+    Hyperparameter mode:
+      - 'fixed': kernel hyperparameters are held constant
+      - 'fit': refit hyperparameters on current (X, y) via ML-II when calling
+               `refit_hyperparams()`; `append(..., maybe_refit=True)` can auto-trigger.
+    """
+    X: torch.Tensor  # [t, dx]
+    y: torch.Tensor  # [t]
+    kernel: Kernel
+    noise: float
+    update_mode: Literal['exact_full', 'exact_rank1', 'sparse_inducing'] = 'exact_rank1'
+    hyperparam_mode: Literal['fixed', 'fit'] = 'fixed'
+    cache: Dict[str, Any] = field(default_factory=dict)
+    # For sparse inducing (optional fields)
+    Z: Optional[torch.Tensor] = None  # [M, dx] inducing inputs
+
+    # ---------------- Internal helpers ----------------
+    def _kernel_matrix(self, X: torch.Tensor) -> torch.Tensor:
+        K = self.kernel.cov(X, X)
+        K = K + (self.noise + 1e-8) * torch.eye(X.shape[0], dtype=X.dtype, device=X.device)
+        return K
+
+    def _recompute_cache_full(self) -> None:
+        if self.X.numel() == 0:
+            self.cache.clear()
+            return
+        K = self._kernel_matrix(self.X)
+        L = torch.linalg.cholesky(K)
+        alpha = torch.cholesky_solve(self.y[:, None], L).squeeze(-1)  # [t]
+        self.cache["L"] = L
+        self.cache["alpha"] = alpha
+
+    def _append_rank1(self, x_new: torch.Tensor, y_new: torch.Tensor) -> None:
+        """Rank-1 Cholesky append.
+        Given existing L for K(X, X), compute L_new for augmented K' with x_new.
+        """
+        t = self.X.shape[0]
+        if t == 0:
+            # Bootstrap with full build
+            self.X = x_new[None, :]
+            self.y = y_new[None]
+            self._recompute_cache_full()
+            return
+        # Augment X, y
+        X_old = self.X
+        self.X = torch.cat([self.X, x_new[None, :]], dim=0)
+        self.y = torch.cat([self.y, y_new[None]], dim=0)
+        # Previous cache must exist
+        if "L" not in self.cache:
+            self._recompute_cache_full()
+            return
+        L = self.cache["L"]  # [t,t]
+        # Build cross-covariances
+        k = self.kernel.cov(x_new[None, :], X_old).squeeze(0)  # [t]
+        kxx = self.kernel.cov(x_new[None, :], x_new[None, :]).squeeze() + (self.noise + 1e-8)
+        # Solve v = L^{-1} k
+        v = torch.linalg.solve_triangular(L, k[:, None], upper=False).squeeze(-1)  # [t]
+        # Compute new diagonal element
+        diag_new = torch.sqrt((kxx - (v @ v)).clamp_min(1e-14))
+        # Assemble L_new
+        L_new = torch.zeros(t + 1, t + 1, dtype=L.dtype, device=L.device)
+        L_new[:t, :t] = L
+        L_new[t, :t] = 0.0
+        L_new[:t, t] = v
+        L_new[t, t] = diag_new
+        # Recompute alpha efficiently by triangular solves on augmented system
+        y_aug = self.y
+        alpha_new = torch.cholesky_solve(y_aug[:, None], L_new).squeeze(-1)
+        self.cache["L"] = L_new
+        self.cache["alpha"] = alpha_new
+
+    def _recompute_cache(self) -> None:
+        if self.update_mode == 'exact_full':
+            self._recompute_cache_full()
+        elif self.update_mode == 'exact_rank1':
+            # For recompute, just call full; rank-1 is used in append path.
+            self._recompute_cache_full()
+        elif self.update_mode == 'sparse_inducing':
+            raise NotImplementedError("SVGP/FITC sparse-inducing mode not implemented in this snippet.")
+        else:
+            raise ValueError(f"Unknown update_mode: {self.update_mode}")
+
+    # ---------------- Public API ----------------
+    def predict(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.X.numel() == 0:
+            return torch.zeros(x.shape[0], dtype=x.dtype, device=x.device), self.kernel.diag(x)
+        if "L" not in self.cache:
+            self._recompute_cache()
+        L: torch.Tensor = self.cache["L"]
+        alpha: torch.Tensor = self.cache["alpha"]
+        kx = self.kernel.cov(x, self.X)  # [b, t]
+        mu = kx @ alpha  # [b]
+        v = torch.cholesky_solve(kx.transpose(0, 1), L)  # [t,b]
+        var = self.kernel.diag(x) - (kx * v.transpose(0, 1)).sum(-1)
+        var = var.clamp_min(1e-12)
+        return mu, var
+
+    def log_predictive(self, y: torch.Tensor, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (mu, var, logpdf) for δ at x for observation y."""
+        mu, var = self.predict(x if x.dim() == 2 else x[None, :])
+        lp = normal_logpdf(y if y.dim() > 0 else y[None], mu[:, None], var[:, None]).squeeze(-1)
+        return mu, var, lp
+
+    def append(self, x_new: torch.Tensor, y_new: torch.Tensor, maybe_refit: bool = False) -> "OnlineGPState":
+        if self.update_mode == 'exact_rank1':
+            self._append_rank1(x_new, y_new)
+        elif self.update_mode == 'exact_full':
+            if self.X.numel() == 0:
+                self.X = x_new[None, :]
+                self.y = y_new[None]
+            else:
+                self.X = torch.cat([self.X, x_new[None, :]], dim=0)
+                self.y = torch.cat([self.y, y_new[None]], dim=0)
+            self._recompute_cache_full()
+        elif self.update_mode == 'sparse_inducing':
+            raise NotImplementedError("SVGP/FITC sparse-inducing mode not implemented in this snippet.")
+        else:
+            raise ValueError(f"Unknown update_mode: {self.update_mode}")
+
+        if self.hyperparam_mode == 'fit' and maybe_refit:
+            self.refit_hyperparams()
+        return self
+
+    # ---------------- Hyperparameter refit (optional) ----------------
+    def refit_hyperparams(self, max_iter: int = 100, lr: float = 0.1, fit_noise: bool = True) -> None:
+        """Refit kernel hyperparameters by maximizing the GP log marginal likelihood.
+        This creates temporary trainable tensors from the kernel's current values,
+        optimizes them, then writes back to the kernel (and noise if chosen).
+        """
+        if self.X.numel() == 0:
+            return
+        # Get current values
+        device, dtype = self.X.device, self.X.dtype
+        # Convert to trainable log-parameters for positivity
+        lengthscale = getattr(self.kernel, 'lengthscale', 1.0)
+        variance = getattr(self.kernel, 'variance', 1.0)
+        ls_tensor = torch.as_tensor(lengthscale, dtype=dtype, device=device)
+        var_tensor = torch.as_tensor(variance, dtype=dtype, device=device)
+        log_ls = torch.nn.Parameter(torch.log(ls_tensor))
+        log_var = torch.nn.Parameter(torch.log(var_tensor))
+        log_noise = torch.nn.Parameter(torch.log(torch.tensor(self.noise, dtype=dtype, device=device)))
+        params = [log_ls, log_var] + ([log_noise] if fit_noise else [])
+        opt = torch.optim.Adam(params, lr=lr)
+
+        def set_kernel_params():
+            # Write exp(params) back into kernel instance for K computation
+            ls_val = torch.exp(log_ls).detach()
+            var_val = float(torch.exp(log_var).detach().mean().item())  # scalar variance
+            # Allow vector lengthscales
+            self.kernel.lengthscale = ls_val
+            if hasattr(self.kernel, 'variance'):
+                self.kernel.variance = var_val
+            if fit_noise:
+                self.noise = float(torch.exp(log_noise).detach().item())
+
+        for _ in range(max_iter):
+            opt.zero_grad()
+            # Build K with current params
+            set_kernel_params()
+            K = self._kernel_matrix(self.X)
+            L = torch.linalg.cholesky(K)
+            alpha = torch.cholesky_solve(self.y[:, None], L)
+            # Log marginal likelihood
+            mll = -0.5 * (self.y[:, None].transpose(0, 1) @ alpha).squeeze()
+            mll += -torch.log(torch.diagonal(L)).sum()
+            mll += -0.5 * self.X.shape[0] * torch.log(2.0 * torch.pi)
+            loss = -mll
+            loss.backward()
+            opt.step()
+        # Final write-back and cache recompute
+        set_kernel_params()
+        self._recompute_cache_full()
+
+# =============================================================
+class Emulator:
+    def predict(self, x: torch.Tensor, theta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]: ...
+    def grad_theta(self, x: torch.Tensor, theta: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
+
+
+class DeterministicSimulator(Emulator):
+    def __init__(self, func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor], enable_autograd: bool = True):
+        self.func = func
+        self.enable_autograd = enable_autograd
+
+    def predict(self, x: torch.Tensor, theta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x: [b, dx] or [dx]; theta: [N, dθ] -> return [b,N]
+        if x.dim() == 1:
+            x = x[None, :]
+        b = x.shape[0]
+        N = theta.shape[0]
+        # Broadcast: evaluate eta for each (x_b, theta_n)
+        # We'll vectorize over particles in a loop if func isn't vectorized; keep simple
+        mu = []
+        for n in range(N):
+            out = self.func(x, theta[n:n+1, :]).squeeze(-1)  # expect [b,1]
+            mu.append(out)
+        mu_eta = torch.stack(mu, dim=1)  # [b,N]
+        var_eta = torch.zeros_like(mu_eta)
+        return mu_eta, var_eta
+
+    def grad_theta(self, x: torch.Tensor, theta: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not self.enable_autograd:
+            raise RuntimeError("grad_theta called but enable_autograd=False")
+        if x.dim() == 1:
+            x = x[None, :]
+        b, N, dth = x.shape[0], theta.shape[0], theta.shape[1]
+        dmu = torch.zeros(b, N, dth, dtype=theta.dtype, device=theta.device)
+        for n in range(N):
+            th = theta[n:n+1, :].detach().requires_grad_(True)
+            y = self.func(x, th).squeeze(-1)  # [b]
+            for k in range(b):
+                grads = torch.autograd.grad(y[k], th, retain_graph=True, create_graph=False, allow_unused=True)[0]
+                if grads is None:
+                    grads = torch.zeros_like(th)
+                dmu[k, n, :] = grads.squeeze(0)
+        return dmu, None  # var grad unknown (0)
+
+
+# =============================================================
+# file: calib/particles.py
+# =============================================================
+from dataclasses import dataclass
+
+@dataclass
+class ParticleSet:
+    theta: torch.Tensor  # [N, dθ]
+    logw: torch.Tensor   # [N]
+
+    def normalize_(self) -> None:
+        m = torch.logsumexp(self.logw, dim=0)
+        self.logw = self.logw - m
+
+    def weights(self) -> torch.Tensor:
+        self.normalize_()
+        return torch.exp(self.logw)
+
+    def ess(self) -> torch.Tensor:
+        w = self.weights()
+        return 1.0 / (w.pow(2).sum() + 1e-16)
+
+
+# =============================================================
+# file: calib/likelihood.py
+# =============================================================
+
+def normal_logpdf(y: torch.Tensor, mu: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
+    # y: [b] or [] ; mu,var: [b,N]
+    if y.dim() == 0:
+        y = y[None]
+    b = y.shape[0]
+    yb = y[:, None].expand_as(mu)
+    log_det = -0.5 * torch.log(2.0 * torch.pi * var)
+    quad = -0.5 * (yb - mu).pow(2) / var
+    return log_det + quad  # [b,N]
+
+
+def predictive_stats(rho: float,
+                      mu_eta: torch.Tensor,
+                      var_eta: torch.Tensor,
+                      mu_delta: torch.Tensor,
+                      var_delta: torch.Tensor,
+                      sigma_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    mu = rho * mu_eta + mu_delta[:, None]
+    var = (rho**2) * var_eta + var_delta[:, None] + (sigma_eps**2)
+    var = var.clamp_min(1e-12)
+    return mu, var
+
+
+def loglik_and_grads(y: torch.Tensor,
+                     x: torch.Tensor,
+                     particles: ParticleSet,
+                     emulator: Emulator,
+                     delta_state: OnlineGPState,
+                     rho: float,
+                     sigma_eps: float,
+                     need_grads: bool = False) -> Dict[str, torch.Tensor]:
+    if x.dim() == 1:
+        x = x[None, :]
+    mu_eta, var_eta = emulator.predict(x, particles.theta)  # [b,N]
+    mu_delta, var_delta = delta_state.predict(x)            # [b],[b]
+    mu, var = predictive_stats(rho, mu_eta, var_eta, mu_delta, var_delta, sigma_eps)
+    loglik_bn = normal_logpdf(y, mu, var)  # [b,N]
+    out: Dict[str, torch.Tensor] = {"loglik": loglik_bn.squeeze(0)}  # assume b=1 online
+
+    if need_grads:
+        dmu_dth, dvar_dth = emulator.grad_theta(x, particles.theta)  # [b,N,dθ]
+        b, N, dth = dmu_dth.shape
+        # Gradient wrt theta using provided formula
+        yb = y.view(b, 1, 1).expand(b, N, dth)
+        mu3 = mu.view(b, N, 1).expand_as(dmu_dth)
+        var3 = var.view(b, N, 1).expand_as(dmu_dth)
+        term1 = (yb - mu3) / var3 * dmu_dth
+        if dvar_dth is None:
+            dvar_dth = torch.zeros_like(dmu_dth)
+        term2 = -0.5 / var3 * dvar_dth
+        term3 = 0.5 * (yb - mu3).pow(2) / (var3.pow(2)) * dvar_dth
+        grad = (term1 + term2 + term3).sum(0)  # [N,dθ] (since b=1)
+        out["grad"] = grad
+    return out
+
+
+# =============================================================
+# file: calib/resampling.py
+# =============================================================
+
+def resample_indices(weights: torch.Tensor, scheme: str = "systematic") -> torch.Tensor:
+    N = weights.numel()
+    if scheme == "multinomial":
+        return torch.multinomial(weights, N, replacement=True)
+    u0 = torch.rand(1, device=weights.device) / N
+    if scheme == "stratified":
+        u = (torch.arange(N, device=weights.device, dtype=weights.dtype) + torch.rand(N, device=weights.device)) / N
+    else:  # systematic
+        u = u0 + torch.arange(N, device=weights.device, dtype=weights.dtype) / N
+    cdf = torch.cumsum(weights, dim=0)
+    idx = torch.searchsorted(cdf, u.clamp(max=1-1e-12))
+    return idx
+
+
+def random_walk_move(theta: torch.Tensor, scale: float) -> torch.Tensor:
+    return theta + scale * torch.randn_like(theta)
+
+
+def liu_west_move(theta: torch.Tensor, weights: torch.Tensor, a: float, h2: Optional[float] = None) -> torch.Tensor:
+    if h2 is None:
+        h2 = 1.0 - a**2
+    mean = (weights[:, None] * theta).sum(dim=0, keepdim=True)  # [1,d]
+    cov = (weights[:, None] * (theta - mean)).T @ (theta - mean)  # [d,d]
+    N, d = theta.shape
+    noise = torch.distributions.MultivariateNormal(torch.zeros(d, device=theta.device, dtype=theta.dtype), h2 * cov + 1e-9 * torch.eye(d, device=theta.device, dtype=theta.dtype))
+    shrunk = a * theta + (1 - a) * mean
+    return shrunk + noise.sample((N,))
+
+
+def laplace_proposal(theta: torch.Tensor,
+                     grad: torch.Tensor,
+                     hess_approx: torch.Tensor,
+                     alpha: float,
+                     beta: float) -> torch.Tensor:
+    # θ' ~ N(θ + η∇, Σ) with Σ = α H^{-1} + β I
+    N, d = theta.shape
+    eye = torch.eye(d, dtype=theta.dtype, device=theta.device)
+    try:
+        Hinv = torch.linalg.pinv(hess_approx)  # robust inverse
+    except Exception:
+        Hinv = eye
+    Sigma = alpha * Hinv + beta * eye
+    L = torch.linalg.cholesky(Sigma + 1e-9 * eye)
+    eta = 1.0
+    mean = theta + eta * grad  # [N,d] broadcast if grad is [N,d]
+    z = torch.randn_like(theta)
+    return mean + z @ L.T
+
+
+def pmcmc_move(theta: torch.Tensor,
+               logpost_fn: Callable[[torch.Tensor], torch.Tensor],
+               steps: int = 1,
+               proposal_scale: float = 0.05) -> torch.Tensor:
+    N, d = theta.shape
+    cur = theta.clone()
+    cur_lp = logpost_fn(cur)
+    for _ in range(steps):
+        prop = cur + proposal_scale * torch.randn_like(cur)
+        prop_lp = logpost_fn(prop)
+        acc = torch.rand(N, device=theta.device) < torch.exp((prop_lp - cur_lp).clamp(max=50))
+        cur[acc] = prop[acc]
+        cur_lp[acc] = prop_lp[acc]
+    return cur
+
+
+# =============================================================
+# file: calib/pf.py
+# =============================================================
+from typing import Any
+
+class ParticleFilter:
+    def __init__(self, particles: ParticleSet, config: PFConfig, device: str = "cpu", dtype: torch.dtype = torch.float64):
+        self.particles = particles
+        self.config = config
+        self.device = device
+        self.dtype = dtype
+
+    @classmethod
+    def from_prior(cls, prior_sampler: Callable[[int], torch.Tensor], pf_config: PFConfig,
+                   device: str = "cpu", dtype: torch.dtype = torch.float64) -> "ParticleFilter":
+        theta = prior_sampler(pf_config.num_particles).to(device=device, dtype=dtype)
+        logw = torch.full((pf_config.num_particles,), -math.log(pf_config.num_particles), dtype=dtype, device=device)
+        return cls(ParticleSet(theta=theta, logw=logw), pf_config, device, dtype)
+
+    def _maybe_move(self, emulator: Emulator, delta_state: OnlineGPState, x_t: torch.Tensor, y_t: torch.Tensor,
+                    rho: float, sigma_eps: float) -> None:
+        move = self.config.move_strategy
+        if move == "none":
+            return
+        w = self.particles.weights()
+        if move == "random_walk":
+            self.particles.theta = random_walk_move(self.particles.theta, self.config.random_walk_scale)
+        elif move == "liu_west":
+            self.particles.theta = liu_west_move(self.particles.theta, w, self.config.liu_west_a, self.config.liu_west_h2)
+        elif move == "laplace":
+            info = loglik_and_grads(y_t, x_t, self.particles, emulator, delta_state, rho, sigma_eps, need_grads=True)
+            grad = info["grad"]
+            # simple Fisher approx (diagonalized across particles): use per-particle outer products mean
+            H = (grad[:, :, None] * grad[:, None, :]).mean(0) + 1e-6 * torch.eye(grad.shape[1], dtype=self.dtype, device=self.device)
+            self.particles.theta = laplace_proposal(self.particles.theta, grad, H, self.config.laplace_alpha, self.config.laplace_beta)
+        elif move == "pmcmc":
+            def logpost(th: torch.Tensor) -> torch.Tensor:
+                ps = ParticleSet(theta=th, logw=torch.zeros(th.shape[0], dtype=self.dtype, device=self.device))
+                ll = loglik_and_grads(y_t, x_t, ps, emulator, delta_state, rho, sigma_eps, need_grads=False)["loglik"]
+                return ll  # flat prior
+            self.particles.theta = pmcmc_move(self.particles.theta, logpost, steps=self.config.pmcmc_steps, proposal_scale=self.config.random_walk_scale)
+
+    def step(self,
+             x_t: torch.Tensor,
+             y_t: torch.Tensor,
+             emulator: Emulator,
+             delta_state: OnlineGPState,
+             rho: float,
+             sigma_eps: float,
+             grad_info: bool = False) -> Dict[str, Any]:
+        # Compute per-particle log-likelihood
+        info = loglik_and_grads(y_t, x_t, self.particles, emulator, delta_state, rho, sigma_eps, need_grads=grad_info)
+        loglik_n = info["loglik"]  # [N]
+        # Evidence under current particles (mixture)
+        logw = self.particles.logw
+        logmix = torch.logsumexp(logw + loglik_n, dim=0)
+        # Weight update
+        self.particles.logw = logw + loglik_n
+        self.particles.normalize_()
+        ess = self.particles.ess().item()
+        N = self.particles.theta.shape[0]
+        resampled = False
+        if ess < self.config.resample_ess_ratio * N:
+            idx = resample_indices(self.particles.weights(), scheme=self.config.resample_scheme)
+            self.particles.theta = self.particles.theta[idx]
+            self.particles.logw = torch.full_like(self.particles.logw, -math.log(N))
+            resampled = True
+            # Optional: move step to rejuvenate diversity
+            self._maybe_move(emulator, delta_state, x_t, y_t, rho, sigma_eps)
+        # Return diagnostics
+        return {
+            "log_evidence": float(logmix),
+            "ess": ess,
+            "resampled": resampled,
+            "maybe_grad": info.get("grad", None),
+        }
+
+
+# =============================================================
+# file: calib/bocpd.py
+# =============================================================
+from dataclasses import dataclass
+
+@dataclass
+class Expert:
+    run_length: int
+    pf: ParticleFilter
+    delta_state: OnlineGPState
+    log_mass: float  # BOCPD run-length mass for this expert
+
+
+class BOCPD:
+    def __init__(self, config: BOCPDConfig, device: str = "cpu", dtype: torch.dtype = torch.float64):
+        self.config = config
+        self.device = device
+        self.dtype = dtype
+        self.experts: List[Expert] = []
+
+    def _haz(self, r: int) -> float:
+        t = torch.tensor(float(r), dtype=self.dtype, device=self.device)
+        val = self.config.hazard(t)
+        return float(val if isinstance(val, torch.Tensor) else val)
+
+    def ump(self, x_t: torch.Tensor, y_t: torch.Tensor, emulator: Emulator, model_cfg: ModelConfig) -> List[float]:
+        # Compute per-expert predictive mixture likelihood (before PF weight update)
+        umps: List[float] = []
+        for e in self.experts:
+            # Copy weights but do not mutate
+            ps = e.pf.particles
+            info = loglik_and_grads(y_t, x_t, ps, emulator, e.delta_state, model_cfg.rho, model_cfg.sigma_eps, need_grads=False)
+            loglik = info["loglik"]
+            logmix = torch.logsumexp(ps.logw + loglik, dim=0)
+            umps.append(float(logmix))
+        return umps
+
+    def update(self,
+               x_t: torch.Tensor,
+               y_t: torch.Tensor,
+               emulator: Emulator,
+               model_cfg: ModelConfig,
+               pf_cfg: PFConfig,
+               prior_sampler: Callable[[int], torch.Tensor]) -> Dict[str, Any]:
+        if len(self.experts) == 0:
+            # bootstrap one expert
+            kernel = make_kernel(model_cfg.delta_kernel)
+            delta0 = OnlineGPState(X=torch.empty(0, x_t.numel(), dtype=model_cfg.dtype, device=model_cfg.device),
+                                   y=torch.empty(0, dtype=model_cfg.dtype, device=model_cfg.device),
+                                   kernel=kernel, noise=model_cfg.delta_kernel.noise)
+            pf0 = ParticleFilter.from_prior(prior_sampler, pf_cfg, model_cfg.device, model_cfg.dtype)
+            self.experts = [Expert(run_length=0, pf=pf0, delta_state=delta0, log_mass=0.0)]
+
+        # 1) UMP per expert (log space)
+        log_umps = self.ump(x_t, y_t, emulator, model_cfg)  # list of floats
+        log_umps_t = torch.tensor(log_umps, dtype=self.dtype, device=self.device)
+
+        # 2) BOCPD mass update
+        prev_log_mass = torch.tensor([e.log_mass for e in self.experts], dtype=self.dtype, device=self.device)
+        hazards = torch.tensor([self._haz(e.run_length) for e in self.experts], dtype=self.dtype, device=self.device)
+        log_h = torch.log(hazards.clamp_min(1e-12))
+        log_1mh = torch.log((1.0 - hazards).clamp_min(1e-12))
+
+        # Growth terms (no changepoint)
+        growth_log_mass = prev_log_mass + log_1mh + log_umps_t  # elementwise
+        # Changepoint term aggregates all run-lengths collapsing into r=0
+        cp_log_mass = torch.logsumexp(prev_log_mass + log_h + log_umps_t, dim=0)
+
+        # 3) Spawn/update experts
+        # Update existing experts' run-length and masses
+        for i, e in enumerate(self.experts):
+            e.run_length = min(e.run_length + 1, self.config.max_run_length)
+            e.log_mass = float(growth_log_mass[i])
+        # New expert at r=0
+        kernel = make_kernel(model_cfg.delta_kernel)
+        delta_new = OnlineGPState(X=torch.empty(0, x_t.numel(), dtype=model_cfg.dtype, device=model_cfg.device),
+                                  y=torch.empty(0, dtype=model_cfg.dtype, device=model_cfg.device),
+                                  kernel=kernel, noise=model_cfg.delta_kernel.noise)
+        pf_new = ParticleFilter.from_prior(prior_sampler, pf_cfg, model_cfg.device, model_cfg.dtype)
+        new_expert = Expert(run_length=0, pf=pf_new, delta_state=delta_new, log_mass=float(cp_log_mass))
+        self.experts.append(new_expert)
+
+        # 4) Normalize masses and prune top-k
+        masses = torch.tensor([e.log_mass for e in self.experts], dtype=self.dtype, device=self.device)
+        masses = masses - torch.logsumexp(masses, dim=0)
+        for i, e in enumerate(self.experts):
+            e.log_mass = float(masses[i])
+        # prune
+        self.experts.sort(key=lambda e: e.log_mass, reverse=True)
+        self.experts = self.experts[: self.config.max_experts]
+
+        # 5) Update each expert's PF weights (filter step) and their δ-GP residuals
+        cp_prob = float(torch.exp(torch.tensor(new_expert.log_mass)))
+        diags = []
+        for e in self.experts:
+            # PF step (weights + optional resample/move)
+            diag = e.pf.step(x_t, y_t, emulator, e.delta_state, model_cfg.rho, model_cfg.sigma_eps, grad_info=False)
+            diags.append(diag)
+            # Compute mixture mean of η for residual update using *updated* weights (common pragmatic choice)
+            mu_eta, _ = emulator.predict(x_t[None, :], e.pf.particles.theta)  # [1,N]
+            w = e.pf.particles.weights()[None, :]
+            eta_mix = (w * mu_eta).sum(dim=1).squeeze(0)
+            resid = y_t - model_cfg.rho * eta_mix
+            e.delta_state.append(x_t, resid)
+
+        return {
+            "p_cp": cp_prob,
+            "num_experts": len(self.experts),
+            "experts_log_mass": [float(e.log_mass) for e in self.experts],
+            "pf_diags": diags,
+        }
+
+
+# =============================================================
+# file: calib/online_calibrator.py
+# =============================================================
+class OnlineBayesCalibrator:
+    def __init__(self,
+                 calib_cfg: CalibrationConfig,
+                 emulator: Emulator,
+                 prior_sampler: Callable[[int], torch.Tensor],
+                 init_delta_state: Optional[Callable[[], OnlineGPState]] = None):
+        self.cfg = calib_cfg
+        self.emulator = emulator
+        self.prior_sampler = prior_sampler
+        self.init_delta_state = init_delta_state  # not used; BOCPD builds states with kernel cfg
+        self.bocpd = BOCPD(calib_cfg.bocpd, device=calib_cfg.model.device, dtype=calib_cfg.model.dtype)
+
+    def step(self, x_t: torch.Tensor, y_t: torch.Tensor) -> Dict[str, Any]:
+        out = self.bocpd.update(x_t.to(self.cfg.model.device, self.cfg.model.dtype),
+                                y_t.to(self.cfg.model.device, self.cfg.model.dtype),
+                                self.emulator, self.cfg.model, self.cfg.pf, self.prior_sampler)
+        return out
+
+    def _aggregate_particles(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        # mixture across experts by their masses
+        if len(self.bocpd.experts) == 0:
+            return None, None
+        d = self.bocpd.experts[0].pf.particles.theta.shape[1]
+        mean = torch.zeros(d, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
+        cov = torch.zeros(d, d, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
+        for e in self.bocpd.experts:
+            w_e = math.exp(e.log_mass)
+            w = e.pf.particles.weights()
+            th = e.pf.particles.theta
+            m = (w[:, None] * th).sum(0)
+            C = ((th - m) * w[:, None]).T @ (th - m)
+            mean = mean + w_e * m
+            cov = cov + w_e * (C + (m - mean)[:, None] @ (m - mean)[None, :])
+        return mean, cov
+
+    def predict(self, x_next: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # mixture over experts and their particles
+        xs = x_next.to(self.cfg.model.device, self.cfg.model.dtype)
+        mix_mu = 0.0
+        mix_var = 0.0
+        Z = 0.0
+        for e in self.bocpd.experts:
+            w_e = math.exp(e.log_mass)
+            mu_eta, var_eta = self.emulator.predict(xs[None, :], e.pf.particles.theta)  # [1,N]
+            mu_delta, var_delta = e.delta_state.predict(xs[None, :])  # [1]
+            mu, var = predictive_stats(self.cfg.model.rho, mu_eta, var_eta, mu_delta, var_delta, self.cfg.model.sigma_eps)
+            w = e.pf.particles.weights()[None, :]
+            mu_mix = (w * mu).sum(dim=1)  # [1]
+            var_mix = (w * (var + mu**2)).sum(dim=1) - mu_mix**2
+            mix_mu += w_e * mu_mix.squeeze(0)
+            mix_var += w_e * var_mix.squeeze(0)
+            Z += w_e
+        mix_mu = mix_mu / max(Z, 1e-12)
+        mix_var = mix_var / max(Z, 1e-12)
+        return {"mu": mix_mu, "var": mix_var}
+
+
+# =============================================================
+# file: calib/data.py
+# =============================================================
+@dataclass
+class SyntheticGeneratorConfig:
+    theta_true: torch.Tensor  # [dθ]
+    rho: float
+    sigma_eps: float
+    delta_kernel: DeltaKernelConfig
+    x_dist: Callable[[int], torch.Tensor]  # sampler for X: returns [b, dx]
+
+
+class SyntheticDataStream:
+    def __init__(self,
+                 cfg: SyntheticGeneratorConfig,
+                 eta_func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+                 seed: Optional[int] = None):
+        self.cfg = cfg
+        self.eta_func = eta_func
+        self.rng = torch.Generator(device=cfg.theta_true.device).manual_seed(seed or 0)
+        # Draw one GP function δ ~ GP(0,k)
+        self.kernel = make_kernel(cfg.delta_kernel)
+        self.X_hist = torch.empty(0, cfg.theta_true.numel(), dtype=cfg.theta_true.dtype, device=cfg.theta_true.device)
+        self.y_hist = torch.empty(0, dtype=cfg.theta_true.dtype, device=cfg.theta_true.device)
+
+    def _delta(self, X: torch.Tensor) -> torch.Tensor:
+        # Fast unconditional GP sampling via exact cov every call (for clarity)
+        if X.shape[0] == 0:
+            return torch.zeros(0, dtype=self.cfg.theta_true.dtype, device=self.cfg.theta_true.device)
+        K = self.kernel.cov(X, X) + 1e-9 * torch.eye(X.shape[0], dtype=X.dtype, device=X.device)
+        L = torch.linalg.cholesky(K)
+        z = torch.randn(X.shape[0], dtype=X.dtype, device=X.device, generator=self.rng)
+        return L @ z
+
+    def next(self, batch_size: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
+        X = self.cfg.x_dist(batch_size).to(self.cfg.theta_true.device, self.cfg.theta_true.dtype)
+        mu_eta = self.eta_func(X, self.cfg.theta_true[None, :]).squeeze(-1)  # [b]
+        delta = self._delta(X)
+        eps = self.cfg.sigma_eps * torch.randn(batch_size, dtype=X.dtype, device=X.device, generator=self.rng)
+        Y = self.cfg.rho * mu_eta + delta + eps
+        return X, Y
+
+
+# =============================================================
+# file: calib/utils.py
+# =============================================================
+
+def to_device_dtype(x: torch.Tensor, device: str, dtype: torch.dtype) -> torch.Tensor:
+    return x.to(device=device, dtype=dtype)
+
+
+def summarize_particles(theta: torch.Tensor, weights: torch.Tensor) -> Dict[str, torch.Tensor]:
+    m = (weights[:, None] * theta).sum(0)
+    C = ((theta - m) * weights[:, None]).T @ (theta - m)
+    return {"mean": m, "cov": C}
+
+
+# =============================================================
+# file: examples/run_synthetic.py
+# =============================================================
+if __name__ == "__main__":
+    # 1) Build configs
+    calib_cfg = CalibrationConfig()
+    device, dtype = calib_cfg.model.device, calib_cfg.model.dtype
+
+    # 2) Define prior sampler over θ (toy: 2-D uniform box)
+    def prior_sampler(N: int) -> torch.Tensor:
+        lo = torch.tensor([-1.0, -1.0], dtype=dtype, device=device)
+        hi = torch.tensor([+1.0, +1.0], dtype=dtype, device=device)
+        u = torch.rand(N, 2, dtype=dtype, device=device)
+        return lo + (hi - lo) * u
+
+    # 3) Define toy η(x, θ): η = θ₀ * x₀ + sin(θ₁ * x₁)
+    def eta_func(x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        # x: [b,2], theta: [N,2] or [1,2]
+        if theta.dim() == 1:
+            theta = theta[None, :]
+        if x.dim() == 1:
+            x = x[None, :]
+        # Broadcast per-theta via loop (for clarity)
+        outs = []
+        for n in range(theta.shape[0]):
+            th = theta[n]
+            val = th[0] * x[:, 0] + torch.sin(th[1] * x[:, 1])
+            outs.append(val[:, None])
+        return torch.cat(outs, dim=1)  # [b,N]
+
+    emulator = DeterministicSimulator(func=eta_func, enable_autograd=True)
+
+    # 4) Calibrator orchestrator
+    calibrator = OnlineBayesCalibrator(calib_cfg, emulator, prior_sampler)
+
+    # 5) Synthetic stream
+    stream = SyntheticDataStream(
+        cfg=SyntheticGeneratorConfig(
+            theta_true=torch.tensor([0.3, -0.7], dtype=dtype, device=device),
+            rho=calib_cfg.model.rho,
+            sigma_eps=calib_cfg.model.sigma_eps,
+            delta_kernel=calib_cfg.model.delta_kernel,
+            x_dist=lambda b: torch.rand(b, 2, dtype=dtype, device=device)
+        ),
+        eta_func=lambda X, th: eta_func(X, th)
+    )
+
+    # 6) Run online for a few steps
+    for t in range(10):
+        X_t, Y_t = stream.next()
+        out = calibrator.step(X_t.squeeze(0), Y_t.squeeze(0))
+        print(f"t={t} | p_cp={out['p_cp']:.3f} | experts={out['num_experts']} | ESS(e0)={out['pf_diags'][0]['ess']:.1f}")
