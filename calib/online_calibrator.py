@@ -86,6 +86,46 @@ class OnlineBayesCalibrator:
 
         
         return out
+    
+    def step_batch(self, X_batch: torch.Tensor, Y_batch: torch.Tensor, verbose: bool = False) -> Dict[str, Any]:
+        """批量更新校准器"""
+        out = self.bocpd.update_batch(
+            X_batch.to(self.cfg.model.device, self.cfg.model.dtype),
+            Y_batch.to(self.cfg.model.device, self.cfg.model.dtype),
+            self.emulator,
+            self.cfg.model,
+            self.cfg.pf,
+            self.prior_sampler,
+            verbose=verbose,
+        )
+        if self.bocpd_mode == "restart" and "p_cp" not in out:
+            out["p_cp"] = out.get("p_cp", 0.0)
+        return out
+
+    def predict_batch(self, X_batch: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """批量预测"""
+        X_batch = X_batch.to(self.cfg.model.device, self.cfg.model.dtype)
+        batch_size = X_batch.shape[0]
+        
+        mix_mu = torch.zeros(batch_size, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
+        mix_var = torch.zeros(batch_size, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
+        Z = 0.0
+        
+        for e in self.bocpd.experts:
+            w_e = math.exp(e.log_mass)
+            mu_eta, var_eta = self.emulator.predict(X_batch, e.pf.particles.theta)  # [batch_size, N]
+            mu_delta, var_delta = e.delta_state.predict(X_batch)  # [batch_size]
+            mu, var = predictive_stats(self.cfg.model.rho, mu_eta, var_eta, mu_delta, var_delta, self.cfg.model.sigma_eps)
+            w = e.pf.particles.weights()[None, :]
+            mu_mix = (w * mu).sum(dim=1)  # [batch_size]
+            var_mix = (w * (var + mu**2)).sum(dim=1) - mu_mix**2
+            mix_mu += w_e * mu_mix
+            mix_var += w_e * var_mix
+            Z += w_e
+        
+        mix_mu = mix_mu / max(Z, 1e-12)
+        mix_var = mix_var / max(Z, 1e-12)
+        return {"mu": mix_mu, "var": mix_var}
 
     def _aggregate_particles(self) -> Tuple[torch.Tensor, torch.Tensor]:
         # mixture across experts by their masses

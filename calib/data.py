@@ -34,6 +34,16 @@ class SyntheticDataStream:
                  eta_func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
                  seed: Optional[int] = None):
         self.cfg = cfg
+        try:
+            x_probe = cfg.x_dist(1)
+            # 保证 dtype/device 一致
+            x_probe = x_probe.to(cfg.theta_true.device, cfg.theta_true.dtype)
+            assert x_probe.dim() == 2 and x_probe.shape[0] == 1, "x_dist(1) 必须返回 [1, dx]"
+            self.dx = int(x_probe.shape[1])
+        except Exception as e:
+            # 回退：默认2维（与旧代码兼容），但建议修复 x_dist 以可探测
+            self.dx = 2
+
         self.eta_func = eta_func
         self.rng = torch.Generator(device=cfg.theta_true.device).manual_seed(seed or 0)
         self.kernel = make_kernel(cfg.delta_kernel)
@@ -53,7 +63,7 @@ class SyntheticDataStream:
         """初始化或重新生成 delta GP 函数"""
         self.n_inducing = 100
         self.X_inducing = torch.rand(
-            self.n_inducing, 2, 
+            self.n_inducing, self.dx, 
             dtype=self.cfg.theta_true.dtype, 
             device=self.cfg.theta_true.device
         )
@@ -72,7 +82,7 @@ class SyntheticDataStream:
         """检查并应用 changepoints"""
         for cp in self.cfg.changepoints:
             if cp.time == t_current and cp.time not in self.processed_changepoints:
-                print(f"\n🔄 [t={t_current}] Changepoint detected!")
+                print(f"\n🔄 [t={t_current}] Changepoint occurred!")
                 
                 # 更新 theta
                 if cp.theta_new is not None:

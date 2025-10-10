@@ -153,11 +153,29 @@ class OnlineGPState:
             self.refit_hyperparams()
         return self
 
-    def append_batch(self, X_new: torch.Tensor, Y_new: torch.Tensor, maybe_refit: bool = False) -> "OnlineGPState":
-        """
-        Batch append wrapper, identical to append with batched inputs.
-        """
-        return self.append(X_new, Y_new, maybe_refit=maybe_refit)
+    def append_batch(self, X_new: torch.Tensor, y_new: torch.Tensor, maybe_refit: bool = False) -> None:
+        """批量添加新数据点到GP状态"""
+        if X_new.shape[0] == 0:
+            return
+        
+        if self.X.numel() == 0:
+            self.X = X_new.clone()
+            self.y = y_new.clone()
+            self._recompute_cache_full()
+            return
+        
+        # 批量添加到现有数据
+        self.X = torch.cat([self.X, X_new], dim=0)
+        self.y = torch.cat([self.y, y_new], dim=0)
+        
+        if self.update_mode == "exact_full":
+            self._recompute_cache_full()
+        elif self.update_mode == "exact_rank1":
+            # 对于批量数据，使用full recompute更稳定
+            self._recompute_cache_full()
+        
+        if maybe_refit and self.hyperparam_mode == "fit":
+            self.refit_hyperparams()
 
         # ---------------- Hyperparameter refit (optional) ----------------
     def refit_hyperparams(self, max_iter: int = 100, lr: float = 0.1, fit_noise: bool = True) -> None:

@@ -306,3 +306,143 @@ class BOCPD:
             "hazards": hazards.cpu().numpy().tolist(),
             "log_Z": float(log_Z) if 'log_Z' in locals() else 0.0,
         }
+    
+    def update_batch(
+        self,
+        X_batch: torch.Tensor,  # [batch_size, dx]
+        Y_batch: torch.Tensor,  # [batch_size]
+        emulator: Emulator,
+        model_cfg: ModelConfig,
+        pf_cfg: PFConfig,
+        prior_sampler: Callable[[int], torch.Tensor],
+        verbose: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        批量更新BOCPD，一次性处理整个batch的数据点
+        """
+        X_batch = X_batch.to(self.device, self.dtype)
+        Y_batch = Y_batch.to(self.device, self.dtype)
+        batch_size = X_batch.shape[0]
+        dx = X_batch.shape[1]
+
+        # Bootstrap first expert if needed
+        if len(self.experts) == 0:
+            e0 = self._spawn_new_expert(pf_cfg, model_cfg, dx, prior_sampler, log_mass=0.0)
+            self.experts = [e0]
+
+        # 1) UMP per expert (log space) - 批量计算
+        log_umps = self.ump_batch(X_batch, Y_batch, emulator, model_cfg)  # list[float]
+        log_umps_t = torch.tensor(log_umps, dtype=self.dtype, device=self.device)
+
+        # 2) BOCPD mass update (批量版本)
+        prev_log_mass = torch.tensor([e.log_mass for e in self.experts], dtype=self.dtype, device=self.device)
+        hazards = torch.tensor([self._haz(e.run_length) for e in self.experts], dtype=self.dtype, device=self.device)
+        log_h = torch.log(hazards.clamp_min(1e-12))
+        log_1mh = torch.log((1.0 - hazards).clamp_min(1e-12))
+
+        growth_log_mass = prev_log_mass + log_1mh + log_umps_t
+        cp_log_mass = torch.logsumexp(prev_log_mass + log_h + log_umps_t, dim=0)
+
+        # 3) Update existing experts (run-length + mass) and spawn the new r=0 expert
+        for i, e in enumerate(self.experts):
+            e.run_length = min(e.run_length + batch_size, self.config.max_run_length)
+            e.log_mass = float(growth_log_mass[i])
+        new_expert = self._spawn_new_expert(pf_cfg, model_cfg, dx, prior_sampler, log_mass=float(cp_log_mass))
+        self.experts.append(new_expert)
+
+        # 4) Normalize masses and prune top-K
+        masses = torch.tensor([e.log_mass for e in self.experts], dtype=self.dtype, device=self.device)
+        log_Z = torch.logsumexp(masses, dim=0)
+        masses = masses - log_Z
+        for i, e in enumerate(self.experts):
+            e.log_mass = float(masses[i])
+
+        # sort & prune
+        self.experts.sort(key=lambda e: e.log_mass, reverse=True)
+        pruned_experts = self.experts[self.config.max_experts:]
+        self.experts = self.experts[: self.config.max_experts]
+
+        # 5) Append batch data to each retained expert's raw history
+        for e in self.experts:
+            self._append_hist_batch(e, X_batch, Y_batch, max_len=self.config.max_run_length)
+
+        # 6) PF step per expert (批量版本)
+        diags = []
+        for e in self.experts:
+            diag = e.pf.step_batch(X_batch, Y_batch, emulator, e.delta_state, model_cfg.rho, model_cfg.sigma_eps, grad_info=False)
+            diags.append(diag)
+
+            # Use updated particle weights to build residual and append to delta_state (批量)
+            mu_eta, _ = emulator.predict(X_batch, e.pf.particles.theta)  # [batch_size, N]
+            w = e.pf.particles.weights().view(1, -1)
+            eta_mix = (w * mu_eta).sum(dim=1)  # [batch_size]
+            resid = Y_batch - model_cfg.rho * eta_mix
+            e.delta_state.append_batch(X_batch, resid)
+
+        # 7) 其他逻辑保持不变...
+        self.t += batch_size
+        did_refit = False
+        if self.delta_fitter is not None and self.delta_refit_every > 0 and (self.t % self.delta_refit_every == 0):
+            topk = min(self.delta_refit_topk, len(self.experts))
+            topk_indices = []
+            for i in range(min(topk, len(self.experts))):
+                e = self.experts[i]
+                # 只重拟合有足够数据的expert
+                if e.X_hist.shape[0] >= 10:  
+                    topk_indices.append(i)
+            
+            if topk_indices:
+                _ = self.delta_fitter.refit_topk(
+                    experts=self.experts,
+                    emulator=emulator,
+                    rho=model_cfg.rho,
+                    sigma_eps=model_cfg.sigma_eps,
+                    topk_indices=topk_indices,
+                    init_from_current=True,
+                )
+                did_refit = True
+        
+        # 返回结果
+        r0_expert = next((e for e in self.experts if e.run_length == 0), None)
+        p_cp = float(math.exp(r0_expert.log_mass)) if r0_expert else 0.0
+
+        return {
+            "p_cp": p_cp,
+            "num_experts": len(self.experts),
+            "experts_log_mass": [float(e.log_mass) for e in self.experts],
+            "pf_diags": diags,
+            "log_umps": log_umps,
+            "log_Z": float(log_Z),
+        }
+
+    def ump_batch(self, X_batch: torch.Tensor, Y_batch: torch.Tensor, emulator: Emulator, model_cfg: ModelConfig) -> List[float]:
+        """批量计算per-expert predictive mixture likelihood"""
+        umps: List[float] = []
+        for e in self.experts:
+            ps = e.pf.particles
+            info = loglik_and_grads(Y_batch, X_batch, ps, emulator, e.delta_state, model_cfg.rho, model_cfg.sigma_eps, need_grads=False)
+            loglik = info["loglik"]  # [N] - 已经是sum over batch
+            loglik = torch.clamp(loglik, min=-1e10, max=1e10)
+            logmix = torch.logsumexp(ps.logw + loglik, dim=0)
+            umps.append(float(logmix))
+        return umps
+
+    def _append_hist_batch(self, e: Expert, X_batch: torch.Tensor, Y_batch: torch.Tensor, max_len: int) -> None:
+        """批量添加历史数据"""
+        if e.X_hist.numel() == 0:
+            e.X_hist = X_batch.clone()
+            e.y_hist = Y_batch.clone()
+        else:
+            e.X_hist = torch.cat([e.X_hist, X_batch], dim=0)
+            e.y_hist = torch.cat([e.y_hist, Y_batch], dim=0)
+        
+        # 截断历史
+        if e.X_hist.shape[0] > max_len:
+            e.X_hist = e.X_hist[-max_len:, :]
+            e.y_hist = e.y_hist[-max_len:]
+            
+            # 同步delta_state
+            if e.delta_state.X.shape[0] > max_len:
+                e.delta_state.X = e.delta_state.X[-max_len:, :]
+                e.delta_state.y = e.delta_state.y[-max_len:]
+                e.delta_state._recompute_cache_full()
