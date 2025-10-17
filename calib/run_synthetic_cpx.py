@@ -353,17 +353,25 @@ def plot_comparison_results(results, prefix: str = "exp"):
 
     # 3. Expert Run Length (Standard方法，前两个expert)
     ax3 = axes[1, 0]
+    # std = results["Standard"]
+    # xs_all = std["batch_times_all"]
+    # for expert_key in ["expert_0", "expert_1"]:
+    #     rls = [rl.get(expert_key, 0) for rl in std["expert_run_lengths"]]
+    #     m = min(len(xs_all), len(rls))
+    #     if m > 0:
+    #         ax3.plot(xs_all[:m], rls[:m], label=expert_key.replace("_", " ").title(), linewidth=2)
+
+    # for cp_time in changepoint_times:
+    #     ax3.axvline(x=cp_time, color='red', linestyle='--', alpha=0.7,
+    #                 label='True Changepoint' if cp_time == changepoint_times[0] else "")
     std = results["Standard"]
     xs_all = std["batch_times_all"]
-    for expert_key in ["expert_0", "expert_1"]:
-        rls = [rl.get(expert_key, 0) for rl in std["expert_run_lengths"]]
-        m = min(len(xs_all), len(rls))
+    for k in range(3):
+        key = f"expert_{k}"
+        rls_k = [rl.get(key, float('nan')) for rl in std["expert_run_lengths"]]
+        m = min(len(xs_all), len(rls_k))
         if m > 0:
-            ax3.plot(xs_all[:m], rls[:m], label=expert_key.replace("_", " ").title(), linewidth=2)
-
-    for cp_time in changepoint_times:
-        ax3.axvline(x=cp_time, color='red', linestyle='--', alpha=0.7,
-                    label='True Changepoint' if cp_time == changepoint_times[0] else "")
+            ax3.plot(xs_all[:m], rls_k[:m], label=key.replace("_", " ").title(), linewidth=2)
 
     ax3.set_xlabel('Observation Time (t)')
     ax3.set_ylabel('Run Length')
@@ -433,11 +441,22 @@ def plot_detailed_analysis(results, prefix: str = "exp"):
 
     # 2. Expert质量分析
     ax2 = axes[0, 1]
-    for expert_key in ["expert_0", "expert_1"]:
-        rls = [rl.get(expert_key, 0) for rl in std["expert_run_lengths"]]
-        m = min(len(xs_std), len(rls))
+    # for expert_key in ["expert_0", "expert_1"]:
+    #     rls = [rl.get(expert_key, 0) for rl in std["expert_run_lengths"]]
+    #     m = min(len(xs_std), len(rls))
+    #     if m > 0:
+    #         ax2.plot(xs_std[:m], rls[:m], label=expert_key.replace("_", " ").title(), linewidth=2)
+
+    # # 3. Expert Run Length (Standard方法，前五个expert)
+    # ax3 = axes[1, 0]
+    std = results["Standard"]
+    xs_all = std["batch_times_all"]
+    for k in range(5):
+        key = f"expert_{k}"
+        rls_k = [rl.get(key, float('nan')) for rl in std["expert_run_lengths"]]
+        m = min(len(xs_all), len(rls_k))
         if m > 0:
-            ax2.plot(xs_std[:m], rls[:m], label=expert_key.replace("_", " ").title(), linewidth=2)
+            ax2.plot(xs_all[:m], rls_k[:m], label=key.replace("_", " ").title(), linewidth=2)
 
     for cp_time in std["changepoint_times"]:
         ax2.axvline(x=cp_time, color='red', linestyle='--', alpha=0.7)
@@ -520,16 +539,224 @@ def plot_detailed_analysis(results, prefix: str = "exp"):
     plt.savefig(f'{prefix}_detailed_analysis.png', dpi=300, bbox_inches='tight')
     plt.show()
 
+# ===================== 新增：config2 专用实验 =====================
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-def main():
-    # 可选的单跑入口（默认不执行），推荐使用 run_comparison_experiment
-    print("=" * 60)
-    print("Starting Online Bayesian Calibration with BOCPD (Single-run not configured in this script).")
-    print("=" * 60)
+from .enhanced_data import (
+    create_config2_config,
+    EnhancedSyntheticDataStream,
+    EnhancedChangepointConfig,
+)
+from .emulator import DeterministicSimulator
+
+def computer_model_config2(x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    """
+    y*(x, θ) = sin(5 θ x) + 5x
+    约定：x.shape=[b,1], theta.shape=[N,1]；返回 [b,1]
+    """
+    if x.dim() == 1:
+        x = x[None, :]
+    if theta.dim() == 1:
+        theta = theta[None, :]
+    th = theta[:, 0:1]            # [N,1]
+    xx = x[:, 0:1]                # [b,1]
+    # DeterministicSimulator 会按 N 次调用本函数（每次传入 [1,1] 的 theta）
+    return torch.sin(5.0 * th * xx) + 5.0 * xx
+
+def plot_y_trajectory_3d(all_t: np.ndarray, all_x: np.ndarray, all_y: np.ndarray, cp_times: list, prefix: str = "cfg2"):
+    """
+    绘制 3D 轨迹图：横轴 t（时间/样本序号），纵轴 x，竖轴 y
+    """
+    fig = plt.figure(figsize=(10, 7))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(all_t, all_x, all_y, s=5, alpha=0.35, c=all_t, cmap="viridis")
+    for tcp in cp_times:
+        ax.plot([tcp, tcp], [0, 1], [np.min(all_y), np.min(all_y)], color='red', linestyle='--', linewidth=2, alpha=0.7)
+    ax.set_xlabel("t (observation index)")
+    ax.set_ylabel("x")
+    ax.set_zlabel("y")
+    ax.set_title("Config2: trajectory of (t, x, y)")
+    plt.tight_layout()
+    plt.savefig(f"{prefix}_trajectory_3d.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+def run_config2_experiment(prefix: str = "cfg2"):
+    """
+    使用 enhanced_data.py 的 config2 数据流；batch=200，总观测=4000，4个变点。
+    同一条数据（同一seed和changepoints）分别跑 Standard 与 Restart 并对比。
+    额外绘制 (t,x,y) 的 3D 轨迹图（取 Standard 的一次运行轨迹）。
+    """
+    # --------- 固定规模 ----------
+    target_observations = 4000
+    batch_size = 40
+    assert target_observations % batch_size == 0
+
+    calib_cfg = CalibrationConfig()
+    device, dtype = calib_cfg.model.device, calib_cfg.model.dtype
+
+    # 假设点级 λ_point = 200（不知道就先取 100~300 试探）
+    lambda_point = 800.0
+    B = batch_size
+
+    def hazard_per_batch(r_batch: torch.Tensor) -> torch.Tensor:
+        # 把批级 run_length 映射到点级近似
+        r_points = r_batch * B
+        h_point = 1.0 / (lambda_point + r_points)           # 点级几何 hazard
+        # 批内 B 点合成的批级 hazard
+        return 1.0 - torch.pow(1.0 - h_point, B)
+
+    calib_cfg.bocpd.hazard = hazard_per_batch
+
+    # --------- emulator = config2 的 computer model ----------
+    emulator = DeterministicSimulator(func=computer_model_config2, enable_autograd=True)
+
+    # --------- 构建 config2 数据流（固定batch），并固定 seed 以保证两方法同数据 ----------
+    cfg2 = create_config2_config(
+        n_observations=target_observations,
+        noise_variance=0.04,               # 0.2^2
+        batch_size_range=(batch_size, batch_size),
+    )
+    cp_times = [800, 1600, 2400, 3200]
+    cfg2.changepoints = [
+        EnhancedChangepointConfig(time=cp_times[0], phys_param_new=torch.tensor([6.0, 6.5, 6.0], dtype=dtype, device=device)),
+        EnhancedChangepointConfig(time=cp_times[1], phys_param_new=torch.tensor([5.0, 9.0, 5.0], dtype=dtype, device=device)),
+        EnhancedChangepointConfig(time=cp_times[2], phys_param_new=torch.tensor([4.5, 7.0, 5.5], dtype=dtype, device=device)),
+        EnhancedChangepointConfig(time=cp_times[3], phys_param_new=torch.tensor([5.5, 8.0, 4.5], dtype=dtype, device=device)),
+    ]
+    seed_fixed = 123
+
+    # --------- 先验 θ ∈ [0,3] ----------
+    theta_dim = 1
+    def prior_sampler(N: int) -> torch.Tensor:
+        lo = torch.full((theta_dim,), 0.0, dtype=dtype, device=device)
+        hi = torch.full((theta_dim,), 3.0, dtype=dtype, device=device)
+        u = torch.rand(N, theta_dim, dtype=dtype, device=device)
+        return lo + (hi - lo) * u
+
+    # --------- 对比跑两种方法 ----------
+    results = {}
+    traj_once = None  # 保存一次 (t,x,y) 轨迹用来画3D
+    for method_name, bocpd_mode in [("Standard", "standard"), ("Restart", "restart")]:
+        # 每次都用相同的流和seed
+        stream = EnhancedSyntheticDataStream(cfg2, seed=seed_fixed)
+
+        # 设置 BOCPD 模式
+        calib_cfg.bocpd.bocpd_mode = bocpd_mode
+        if bocpd_mode == "restart":
+            calib_cfg.bocpd.use_backdated_restart = False
+            calib_cfg.bocpd.restart_margin = 0.2
+            calib_cfg.bocpd.restart_cooldown = 2
+        else:
+            calib_cfg.bocpd.use_restart = True
+            calib_cfg.bocpd.restart_threshold = 0.85
+
+        calibrator = OnlineBayesCalibrator(calib_cfg, emulator, prior_sampler)
+
+        prediction_errors, rmse_history, crps_history = [], [], []
+        restart_detections, expert_run_lengths, batch_times_all = [], [], []
+        total_observations = 0
+
+        # 仅第一次运行时记录完整轨迹
+        all_t, all_x, all_y = [], [], []
+
+        while total_observations < target_observations:
+            X_batch, Y_batch = stream.next()
+            batch_size_cur = X_batch.shape[0]
+            batch_times_all.append(total_observations)
+
+            if total_observations > 0:
+                pred_result = calibrator.predict_batch(X_batch)
+                mu_pred = pred_result["mu"]
+                var_pred = pred_result["var"]
+                pred_err = (Y_batch - mu_pred)
+                prediction_errors.extend(pred_err.detach().cpu().numpy().tolist())
+                rmse = float(np.sqrt(np.mean(np.array(prediction_errors, dtype=np.float64) ** 2)))
+                rmse_history.append(rmse)
+                crps_values = calculate_crps(Y_batch, mu_pred, var_pred)
+                crps_history.extend(crps_values.detach().cpu().numpy().tolist())
+
+            out = calibrator.step_batch(X_batch, Y_batch, verbose=False)
+
+            if out.get("did_restart", False):
+                restart_detections.append(total_observations)
+
+            # 记录expert run-length（前2个）
+            # rls = {}
+            # for i, e in enumerate(calibrator.bocpd.experts[:5]):
+            #     rls[f"expert_{i}"] = int(e.run_length)
+            # expert_run_lengths.append(rls)
+            # 记录expert run-length（前5个；缺失用NaN）
+            rls = {}
+            for i in range(5):
+                if i < len(calibrator.bocpd.experts):
+                    rls[f"expert_{i}"] = int(calibrator.bocpd.experts[i].run_length)
+                else:
+                    rls[f"expert_{i}"] = float('nan')
+            expert_run_lengths.append(rls)
+
+            # 仅第一次方法记录 (t,x,y) 轨迹
+            if traj_once is None:
+                t0 = total_observations
+                ts = np.arange(t0, t0 + batch_size_cur)
+                all_t.append(ts)
+                all_x.append(X_batch[:, 0].detach().cpu().numpy())
+                all_y.append(Y_batch.detach().cpu().numpy())
+
+            total_observations += batch_size_cur
+
+        times_rmse = batch_times_all[1:1 + len(rmse_history)]
+        results[method_name] = {
+            "rmse_history": rmse_history,
+            "crps_history": crps_history,
+            "restart_detections": restart_detections,
+            "expert_run_lengths": expert_run_lengths,
+            "batch_times_all": batch_times_all,
+            "times_rmse": times_rmse,
+            "changepoint_times": cp_times,
+        }
+
+        if traj_once is None:
+            traj_once = (
+                np.concatenate(all_t, axis=0),
+                np.concatenate(all_x, axis=0),
+                np.concatenate(all_y, axis=0),
+            )
+
+    # --------- 对比图 + 保存指标 ----------
+    plot_comparison_results(results, prefix=prefix)
+
+    np.savez_compressed(
+        f"{prefix}_results_summary.npz",
+        standard_rmse=np.array(results["Standard"]["rmse_history"]),
+        restart_rmse=np.array(results["Restart"]["rmse_history"]),
+        standard_times_rmse=np.array(results["Standard"]["times_rmse"]),
+        restart_times_rmse=np.array(results["Restart"]["times_rmse"]),
+        standard_cps=np.array(results["Standard"]["changepoint_times"]),
+        restart_cps=np.array(results["Restart"]["changepoint_times"]),
+        standard_restart_detect=np.array(results["Standard"]["restart_detections"]),
+        restart_restart_detect=np.array(results["Restart"]["restart_detections"]),
+    )
+
+    # --------- 3D 轨迹图（取 Standard 的轨迹） ----------
+    if traj_once is not None:
+        all_t, all_x, all_y = traj_once
+        plot_y_trajectory_3d(all_t, all_x, all_y, cp_times, prefix=prefix)
 
 
 if __name__ == "__main__":
-    # 主要入口：对比实验，支持自定义前缀
-    results = run_comparison_experiment(prefix="exp")
+    run_config2_experiment(prefix="cfg2")
+
+
+# def main():
+#     # 可选的单跑入口（默认不执行），推荐使用 run_comparison_experiment
+#     print("=" * 60)
+#     print("Starting Online Bayesian Calibration with BOCPD (Single-run not configured in this script).")
+#     print("=" * 60)
+
+
+# if __name__ == "__main__":
+#     # 主要入口：对比实验，支持自定义前缀
+#     results = run_comparison_experiment(prefix="exp")
     # 如需更多图：打开下面注释
     # plot_detailed_analysis(results, prefix="exp")

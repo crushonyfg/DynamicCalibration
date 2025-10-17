@@ -78,11 +78,11 @@ class BOCPDConfig:
     bocpd_mode: str = "standard"  # "standard" 或 "restart"
     
     hazard: Callable[[torch.Tensor], torch.Tensor] = default_hazard
-    max_experts: int = 5  # keep top-k experts
+    max_experts: int = 10  # keep top-k experts
     max_run_length: int = 512  # truncation for run-length posterior (advisory)
     
     # ✅ Standard BOCPD 相关配置
-    use_restart: bool = True  # 仅用于 standard mode
+    use_restart: bool = False  # 仅用于 standard mode
     restart_threshold: float = 0.8  # 仅用于 standard mode
     restart_small_r: int = 5  # 仅用于 standard mode
     
