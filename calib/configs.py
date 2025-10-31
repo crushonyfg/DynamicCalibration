@@ -92,8 +92,8 @@ class BOCPDConfig:
     restart_cooldown: int = 10  # restart后的冷却期（步数）
     
     log_space: bool = True
-    delta_refit_every: int = 0  # 0 means never
-    delta_refit_topk: int = 1  # 0 means no refit
+    delta_refit_every: int = 1  # 0 means never
+    delta_refit_topk: int = 11  # 0 means no refit
 
 
 @dataclass

@@ -53,6 +53,7 @@ class OnlineBayesCalibrator:
                 device=config.model.device,
                 dtype=config.model.dtype,
                 delta_fitter=None,  # 可选：如果需要delta refitting
+                # delta_fitter=delta_fitter,
                 on_restart=on_restart,
                 notify_on_restart=notify_on_restart,
             )
@@ -65,6 +66,7 @@ class OnlineBayesCalibrator:
                 device=config.model.device,
                 dtype=config.model.dtype,
                 delta_fitter=None,
+                # delta_fitter=delta_fitter,
             )
             self.bocpd_mode = "standard"
             print(f"✅ Using Standard BOCPD mode (use_restart={config.bocpd.use_restart})")

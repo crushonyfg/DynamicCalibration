@@ -588,6 +588,7 @@ def run_config2_experiment(prefix: str = "cfg2"):
     额外绘制 (t,x,y) 的 3D 轨迹图（取 Standard 的一次运行轨迹）。
     """
     # --------- 固定规模 ----------
+    # target_observations = 4000
     target_observations = 4000
     batch_size = 40
     assert target_observations % batch_size == 0
@@ -640,6 +641,8 @@ def run_config2_experiment(prefix: str = "cfg2"):
     for method_name, bocpd_mode in [("Standard", "standard"), ("Restart", "restart")]:
         # 每次都用相同的流和seed
         stream = EnhancedSyntheticDataStream(cfg2, seed=seed_fixed)
+        residuals_his = []
+        variances_his = []
 
         # 设置 BOCPD 模式
         calib_cfg.bocpd.bocpd_mode = bocpd_mode
@@ -675,6 +678,8 @@ def run_config2_experiment(prefix: str = "cfg2"):
                 rmse_history.append(rmse)
                 crps_values = calculate_crps(Y_batch, mu_pred, var_pred)
                 crps_history.extend(crps_values.detach().cpu().numpy().tolist())
+                residuals_his.append(np.mean(pred_err.detach().cpu().numpy().tolist()))
+                variances_his.append(np.mean(var_pred.detach().cpu().numpy().tolist()))
 
             out = calibrator.step_batch(X_batch, Y_batch, verbose=False)
 
@@ -714,6 +719,8 @@ def run_config2_experiment(prefix: str = "cfg2"):
             "batch_times_all": batch_times_all,
             "times_rmse": times_rmse,
             "changepoint_times": cp_times,
+            "variances_his": variances_his,
+            "residuals_his": residuals_his,
         }
 
         if traj_once is None:
@@ -736,7 +743,32 @@ def run_config2_experiment(prefix: str = "cfg2"):
         restart_cps=np.array(results["Restart"]["changepoint_times"]),
         standard_restart_detect=np.array(results["Standard"]["restart_detections"]),
         restart_restart_detect=np.array(results["Restart"]["restart_detections"]),
+        variances_his=np.array(variances_his),
+        residuals_his=np.array(residuals_his),
     )
+
+    plt.figure(figsize=(10,6))
+
+    # --- Standard ---
+    t_std = results["Standard"]["batch_times_all"][1:1 + len(results["Standard"]["residuals_his"])]
+    plt.plot(t_std, results["Standard"]["residuals_his"], label="Standard Residual Mean", color="tab:blue", linewidth=2)
+    plt.plot(t_std, results["Standard"]["variances_his"], label="Standard Pred Var Mean", color="tab:blue", linestyle="--", linewidth=2)
+
+    # --- Restart ---
+    t_rst = results["Restart"]["batch_times_all"][1:1 + len(results["Restart"]["residuals_his"])]
+    plt.plot(t_rst, results["Restart"]["residuals_his"], label="Restart Residual Mean", color="tab:orange", linewidth=2)
+    plt.plot(t_rst, results["Restart"]["variances_his"], label="Restart Pred Var Mean", color="tab:orange", linestyle="--", linewidth=2)
+
+    plt.xlabel("Observation Time (t)")
+    plt.ylabel("Mean Residual / Variance")
+    plt.title("Residual and Predicted Variance Trend")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{prefix}_residual_variance_trend.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+
 
     # --------- 3D 轨迹图（取 Standard 的轨迹） ----------
     if traj_once is not None:

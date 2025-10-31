@@ -175,7 +175,7 @@ class ExpertDeltaFitter:
             (lengthscale_fitted [dx], variance_fitted)
         """
         Xd, yd, noise_vec = build_delta_targets_for_expert(
-            expert.X_hist, expert.y_hist, emulator, expert.particles, rho, sigma_eps
+            expert.X_hist, expert.y_hist, emulator, expert.pf.particles, rho, sigma_eps
         )
         # Init from current delta_state if not provided
         k = expert.delta_state.kernel
