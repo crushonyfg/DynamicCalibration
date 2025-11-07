@@ -12,6 +12,7 @@ from .data import SyntheticDataStream, SyntheticGeneratorConfig, ChangepointConf
 
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
+from .koh_calibrator import KOHCalibrator
 
 rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'SimSun', 'Arial Unicode MS']
 rcParams['axes.unicode_minus'] = False
@@ -639,97 +640,152 @@ def run_config2_experiment(prefix: str = "cfg2"):
     # --------- 对比跑两种方法 ----------
     results = {}
     traj_once = None  # 保存一次 (t,x,y) 轨迹用来画3D
-    for method_name, bocpd_mode in [("Standard", "standard"), ("Restart", "restart")]:
-        # 每次都用相同的流和seed
-        stream = EnhancedSyntheticDataStream(cfg2, seed=seed_fixed)
-        residuals_his = []
-        variances_his = []
+    for method_name, bocpd_mode in [("KOH", "window"),("Standard", "standard"), ("Restart", "restart")]:
+        if method_name in ["Standard", "Restart"]:    
+            stream = EnhancedSyntheticDataStream(cfg2, seed=seed_fixed)
+            residuals_his = []
+            variances_his = []
 
-        # 设置 BOCPD 模式
-        calib_cfg.bocpd.bocpd_mode = bocpd_mode
-        if bocpd_mode == "restart":
-            calib_cfg.bocpd.use_backdated_restart = False
-            calib_cfg.bocpd.restart_margin = 0.2
-            calib_cfg.bocpd.restart_cooldown = 2
-        else:
-            calib_cfg.bocpd.use_restart = True
-            calib_cfg.bocpd.restart_threshold = 0.85
+            # 设置 BOCPD 模式
+            calib_cfg.bocpd.bocpd_mode = bocpd_mode
+            if bocpd_mode == "restart":
+                calib_cfg.bocpd.use_backdated_restart = False
+                calib_cfg.bocpd.restart_margin = 0.2
+                calib_cfg.bocpd.restart_cooldown = 2
+            else:
+                calib_cfg.bocpd.use_restart = True
+                calib_cfg.bocpd.restart_threshold = 0.85
 
-        calibrator = OnlineBayesCalibrator(calib_cfg, emulator, prior_sampler)
+            calibrator = OnlineBayesCalibrator(calib_cfg, emulator, prior_sampler)
 
-        prediction_errors, rmse_history, crps_history = [], [], []
-        restart_detections, expert_run_lengths, batch_times_all = [], [], []
-        total_observations = 0
+            prediction_errors, rmse_history, crps_history = [], [], []
+            restart_detections, expert_run_lengths, batch_times_all = [], [], []
+            total_observations = 0
 
-        # 仅第一次运行时记录完整轨迹
-        all_t, all_x, all_y = [], [], []
+            # 仅第一次运行时记录完整轨迹
+            all_t, all_x, all_y = [], [], []
 
-        while total_observations < target_observations:
-            X_batch, Y_batch = stream.next()
-            batch_size_cur = X_batch.shape[0]
-            batch_times_all.append(total_observations)
+            while total_observations < target_observations:
+                X_batch, Y_batch = stream.next()
+                batch_size_cur = X_batch.shape[0]
+                batch_times_all.append(total_observations)
 
-            if total_observations > 0:
-                pred_result = calibrator.predict_batch(X_batch)
-                mu_pred = pred_result["mu"]
-                var_pred = pred_result["var"]
-                pred_err = (Y_batch - mu_pred)
-                prediction_errors.extend(pred_err.detach().cpu().numpy().tolist())
-                rmse = float(np.sqrt(np.mean(np.array(prediction_errors, dtype=np.float64) ** 2)))
-                rmse_history.append(rmse)
-                crps_values = calculate_crps(Y_batch, mu_pred, var_pred)
-                crps_history.extend(crps_values.detach().cpu().numpy().tolist())
-                residuals_his.append(np.mean(pred_err.detach().cpu().numpy().tolist()))
-                variances_his.append(np.mean(var_pred.detach().cpu().numpy().tolist()))
+                if total_observations > 0:
+                    pred_result = calibrator.predict_batch(X_batch)
+                    mu_pred = pred_result["mu"]
+                    var_pred = pred_result["var"]
+                    pred_err = (Y_batch - mu_pred)
+                    prediction_errors.extend(pred_err.detach().cpu().numpy().tolist())
+                    rmse = float(np.sqrt(np.mean(np.array(prediction_errors, dtype=np.float64) ** 2)))
+                    rmse_history.append(rmse)
+                    crps_values = calculate_crps(Y_batch, mu_pred, var_pred)
+                    crps_history.extend(crps_values.detach().cpu().numpy().tolist())
+                    residuals_his.append(np.mean(pred_err.detach().cpu().numpy().tolist()))
+                    variances_his.append(np.mean(var_pred.detach().cpu().numpy().tolist()))
 
-            out = calibrator.step_batch(X_batch, Y_batch, verbose=False)
+                out = calibrator.step_batch(X_batch, Y_batch, verbose=False)
 
-            if out.get("did_restart", False):
-                restart_detections.append(total_observations)
+                if out.get("did_restart", False):
+                    restart_detections.append(total_observations)
 
-            # 记录expert run-length（前2个）
-            # rls = {}
-            # for i, e in enumerate(calibrator.bocpd.experts[:5]):
-            #     rls[f"expert_{i}"] = int(e.run_length)
-            # expert_run_lengths.append(rls)
-            # 记录expert run-length（前5个；缺失用NaN）
-            rls = {}
-            for i in range(5):
-                if i < len(calibrator.bocpd.experts):
-                    rls[f"expert_{i}"] = int(calibrator.bocpd.experts[i].run_length)
-                else:
-                    rls[f"expert_{i}"] = float('nan')
-            expert_run_lengths.append(rls)
+                # 记录expert run-length（前2个）
+                # rls = {}
+                # for i, e in enumerate(calibrator.bocpd.experts[:5]):
+                #     rls[f"expert_{i}"] = int(e.run_length)
+                # expert_run_lengths.append(rls)
+                # 记录expert run-length（前5个；缺失用NaN）
+                rls = {}
+                for i in range(5):
+                    if i < len(calibrator.bocpd.experts):
+                        rls[f"expert_{i}"] = int(calibrator.bocpd.experts[i].run_length)
+                    else:
+                        rls[f"expert_{i}"] = float('nan')
+                expert_run_lengths.append(rls)
 
-            # 仅第一次方法记录 (t,x,y) 轨迹
+                # 仅第一次方法记录 (t,x,y) 轨迹
+                if traj_once is None:
+                    t0 = total_observations
+                    ts = np.arange(t0, t0 + batch_size_cur)
+                    all_t.append(ts)
+                    all_x.append(X_batch[:, 0].detach().cpu().numpy())
+                    all_y.append(Y_batch.detach().cpu().numpy())
+
+                total_observations += batch_size_cur
+
+            times_rmse = batch_times_all[1:1 + len(rmse_history)]
+            results[method_name] = {
+                "rmse_history": rmse_history,
+                "crps_history": crps_history,
+                "restart_detections": restart_detections,
+                "expert_run_lengths": expert_run_lengths,
+                "batch_times_all": batch_times_all,
+                "times_rmse": times_rmse,
+                "changepoint_times": cp_times,
+                "variances_his": variances_his,
+                "residuals_his": residuals_his,
+            }
+
             if traj_once is None:
-                t0 = total_observations
-                ts = np.arange(t0, t0 + batch_size_cur)
-                all_t.append(ts)
-                all_x.append(X_batch[:, 0].detach().cpu().numpy())
-                all_y.append(Y_batch.detach().cpu().numpy())
-
-            total_observations += batch_size_cur
-
-        times_rmse = batch_times_all[1:1 + len(rmse_history)]
-        results[method_name] = {
-            "rmse_history": rmse_history,
-            "crps_history": crps_history,
-            "restart_detections": restart_detections,
-            "expert_run_lengths": expert_run_lengths,
-            "batch_times_all": batch_times_all,
-            "times_rmse": times_rmse,
-            "changepoint_times": cp_times,
-            "variances_his": variances_his,
-            "residuals_his": residuals_his,
-        }
-
-        if traj_once is None:
-            traj_once = (
-                np.concatenate(all_t, axis=0),
-                np.concatenate(all_x, axis=0),
-                np.concatenate(all_y, axis=0),
+                traj_once = (
+                    np.concatenate(all_t, axis=0),
+                    np.concatenate(all_x, axis=0),
+                    np.concatenate(all_y, axis=0),
+                )
+        elif method_name in ["KOH"]:
+            # --------- KOH baseline (explicit GP δ) ---------
+            koh = KOHCalibrator(
+                simulator=emulator.func,   # 或 lambda X,th: emulator.func(X, th)
+                theta_init=torch.tensor([1.0], dtype=dtype, device=device),  # 你config2是1维θ
+                theta_bounds=(torch.tensor([0.0], dtype=dtype, device=device),
+                            torch.tensor([3.0], dtype=dtype, device=device)),
+                update_mode="full",          # or "full"
+                window_length=800,             # 例如保留最近800个点
+                lengthscale=0.3, variance=1.0, noise_var=0.04,  # 可按需调参/交叉验证
+                optimize_theta=True,
+                optimize_hypers=False,         # 若想联动拟合核超参改 True
+                max_opt_steps=200,
+                device=device, dtype=dtype,
             )
+
+            prediction_errors = []
+            rmse_history = []
+            crps_history = []
+            batch_times_all = []
+            stream = EnhancedSyntheticDataStream(cfg2, seed=seed_fixed)
+
+            total_observations = 0
+            while total_observations < target_observations:
+                X_batch, Y_batch = stream.next()
+                batch_times_all.append(total_observations)
+
+                # 先 predict 再 update，与 BOCPD 一致
+                if total_observations > 0:
+                    out = koh.predict(X_batch)
+                    mu_pred, var_pred = out["mu"], out["var"]
+
+                    # 累积 RMSE（或本批 RMSE，任选一种口径）
+                    err = (Y_batch - mu_pred)
+                    prediction_errors.extend(err.detach().cpu().numpy().tolist())
+                    rmse = float(np.sqrt(np.mean(np.array(prediction_errors, dtype=np.float64) ** 2)))
+                    rmse_history.append(rmse)
+
+                    # CRPS（高斯闭式）
+                    crps_vals = KOHCalibrator.crps_gaussian(Y_batch, mu_pred, var_pred)
+                    crps_history.append(crps_vals)
+
+                koh.update(X_batch, Y_batch)  # 追加数据 +（可选）重拟合 θ/超参
+                total_observations += X_batch.shape[0]
+
+            results["KOH"] = {
+                "rmse_history": rmse_history,
+                "crps_history": crps_history,
+                "restart_detections": [],
+                "expert_run_lengths": [],
+                "batch_times_all": batch_times_all,
+                "times_rmse": batch_times_all[1:1+len(rmse_history)],
+                "changepoint_times": cp_times,
+            }
+
 
     # --------- 对比图 + 保存指标 ----------
     plot_comparison_results(results, prefix=prefix)
