@@ -25,6 +25,7 @@ def best_theta_on_segment(a2, theta_lo=0.05, theta_hi=3.0, n_grid=2001):
     return th_star, thetas, errs
 
 # ---------- 五个分段频率 ----------
+prefix = "cfg2"  # 改成你的实验前缀
 a2_list = [7.5, 5.0, 12.0, 7.0, 11.0]
 theta_stars = []
 all_curves = []
@@ -48,6 +49,7 @@ for i, (a2, ax) in enumerate(zip(a2_list, axes)):
     ax.grid(True, alpha=0.3)
 axes[-1].set_xlabel("θ")
 plt.tight_layout()
+plt.savefig(f"{prefix}_theta_comparison.png", dpi=300, bbox_inches="tight")
 plt.show()
 
 # ============================================================
@@ -77,6 +79,7 @@ for i, (a2, ax) in enumerate(zip(a2_list, axes)):
 
 axes[-1].set_xlabel("x")
 plt.tight_layout()
+plt.savefig(f"{prefix}_theta_examples.png", dpi=300, bbox_inches="tight")
 plt.show()
 
 
@@ -86,7 +89,6 @@ import matplotlib.pyplot as plt
 # ============================================================
 # 读取保存的结果
 # ============================================================
-prefix = "cfg2"  # 改成你的实验前缀
 data = np.load(f"{prefix}_results_summary.npz", allow_pickle=True)
 
 # 提取三种方法的 θ 历史
