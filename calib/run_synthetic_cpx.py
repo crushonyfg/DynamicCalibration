@@ -590,15 +590,15 @@ def run_config2_experiment(prefix: str = "cfg2"):
     """
     # --------- 固定规模 ----------
     # target_observations = 4000
-    target_observations = 4000
-    batch_size = 40
+    target_observations = 400
+    batch_size = 10
     assert target_observations % batch_size == 0
 
     calib_cfg = CalibrationConfig()
     device, dtype = calib_cfg.model.device, calib_cfg.model.dtype
 
     # 假设点级 λ_point = 200（不知道就先取 100~300 试探）
-    lambda_point = 800.0
+    lambda_point = 100.0
     B = batch_size
 
     def hazard_per_batch(r_batch: torch.Tensor) -> torch.Tensor:
@@ -619,7 +619,8 @@ def run_config2_experiment(prefix: str = "cfg2"):
         noise_variance=0.04,               # 0.2^2
         batch_size_range=(batch_size, batch_size),
     )
-    cp_times = [800, 1600, 2400, 3200]
+    # cp_times = [800, 1600, 2400, 3200]
+    cp_times = [20, 150, 200, 360]
     cfg2.changepoints = [
         EnhancedChangepointConfig(time=cp_times[0], phys_param_new=torch.tensor([6.0, 6.5, 6.0], dtype=dtype, device=device)),
         EnhancedChangepointConfig(time=cp_times[1], phys_param_new=torch.tensor([5.0, 9.0, 5.0], dtype=dtype, device=device)),
@@ -833,7 +834,7 @@ def run_config2_experiment(prefix: str = "cfg2"):
 
 
 if __name__ == "__main__":
-    run_config2_experiment(prefix="cfg2")
+    run_config2_experiment(prefix="cfg2_400_nonuniform")
 
 
 # def main():
