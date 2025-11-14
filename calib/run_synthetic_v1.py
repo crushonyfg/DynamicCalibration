@@ -112,7 +112,7 @@ def run_config2_experiment(prefix: str = "cfg2"):
     """
     # -------- Experiment setup --------
     target_observations = 4000
-    batch_size = 40
+    batch_size = 20
     assert target_observations % batch_size == 0
     seed_fixed = 123
 
@@ -159,10 +159,10 @@ def run_config2_experiment(prefix: str = "cfg2"):
         #         max_opt_steps=200,
         #     ),
         # },
-        "Standard": {
-            "type": "bocpd",
-            "bocpd_mode": "standard",
-        },
+        # "Standard": {
+        #     "type": "bocpd",
+        #     "bocpd_mode": "standard",
+        # },
         "Restart": {
             "type": "bocpd",
             "bocpd_mode": "restart",
@@ -421,4 +421,4 @@ def run_config2_experiment(prefix: str = "cfg2"):
 # Entry point
 # -------------------------------------------------------------
 if __name__ == "__main__":
-    run_config2_experiment(prefix="cfg2_t4000")
+    run_config2_experiment(prefix="cfg2_t4000_try")
