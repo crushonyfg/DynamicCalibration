@@ -340,7 +340,7 @@ class BOCPDProjectedCalibrator:
         # latest weights over experts
         self.weights_: Optional[Tensor] = None  # [K,]
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def update(self, X_batch: Tensor, y_batch: Tensor):
         X_batch = self._as2d(X_batch)
         y_batch = y_batch.reshape(-1, 1).to(self.device, self.dtype)

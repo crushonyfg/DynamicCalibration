@@ -79,7 +79,7 @@ class BOCPDConfig:
     
     hazard: Callable[[torch.Tensor], torch.Tensor] = default_hazard
     max_experts: int = 10  # keep top-k experts
-    max_run_length: int = 512  # truncation for run-length posterior (advisory)
+    max_run_length: int = 10000  # truncation for run-length posterior (advisory)
     
     # ✅ Standard BOCPD 相关配置
     use_restart: bool = False  # 仅用于 standard mode

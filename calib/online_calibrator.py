@@ -20,7 +20,9 @@ def my_restart_hook(t_now, r_new, s_star, anchor_rl, p_anchor, best_other):
                  f"anchor_rl={anchor_rl}, p_anchor={p_anchor:.4f}, best={best_other:.4f}")
 
 from .bocpd import BOCPD as StandardBOCPD
-from .restart_bocpd import BOCPD as RestartBOCPD
+# from .restart_bocpd import BOCPD as RestartBOCPD
+# from .restart_bocpd_debug import BOCPD as RestartBOCPD
+from .restart_bocpd_mbr import BOCPD as RestartBOCPD
 
 
 class OnlineBayesCalibrator:

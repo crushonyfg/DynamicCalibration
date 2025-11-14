@@ -373,11 +373,29 @@ class BOCPD:
             diags.append(diag)
 
             # Use updated particle weights to build residual and append to delta_state (批量)
-            mu_eta, _ = emulator.predict(X_batch, e.pf.particles.theta)  # [batch_size, N]
-            w = e.pf.particles.weights().view(1, -1)
-            eta_mix = (w * mu_eta).sum(dim=1)  # [batch_size]
-            resid = Y_batch - model_cfg.rho * eta_mix
-            e.delta_state.append_batch(X_batch, resid)
+            # mu_eta, _ = emulator.predict(X_batch, e.pf.particles.theta)  # [batch_size, N]
+            # w = e.pf.particles.weights().view(1, -1)
+            # eta_mix = (w * mu_eta).sum(dim=1)  # [batch_size]
+            # resid = Y_batch - model_cfg.rho * eta_mix
+            # e.delta_state.append_batch(X_batch, resid)
+            X_hist = e.X_hist
+            Y_hist = e.y_hist
+
+            # 2. 用 PF posterior 更新所有 residual
+            mu_eta_all, _ = emulator.predict(X_hist, e.pf.particles.theta)  # shape [M, N]
+            weights = e.pf.particles.weights().view(1, -1)  # [1, N]
+            eta_mix_all = (weights * mu_eta_all).sum(dim=1)  # [M]
+            resid_all = Y_hist - model_cfg.rho * eta_mix_all
+
+            # 3. 完全重写 delta_state
+            e.delta_state = OnlineGPState(
+                X=X_hist,
+                y=resid_all,
+                kernel=make_kernel(model_cfg.delta_kernel),
+                noise=model_cfg.delta_kernel.noise,
+                update_mode="exact_full",
+                hyperparam_mode="fit",
+            )
 
         # 7) 其他逻辑保持不变...
         self.t += batch_size

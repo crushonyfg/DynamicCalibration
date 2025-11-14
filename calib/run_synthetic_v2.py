@@ -13,6 +13,7 @@ from .koh_calibrator import KOHCalibrator
 from .enhanced_data import create_config2_config, EnhancedSyntheticDataStream, EnhancedChangepointConfig
 from .projected_calibrator import BOCPDProjectedCalibrator
 from .koh_batch_calibrator import KOHBatchCalibrator
+from .moe_calibrator import OnlineMoECalibrator
 
 # -------------------------------------------------------------
 # Global Matplotlib Setup
@@ -159,13 +160,21 @@ def run_config2_experiment(prefix: str = "cfg2"):
         #         max_opt_steps=200,
         #     ),
         # },
-        "Standard": {
-            "type": "bocpd",
-            "bocpd_mode": "standard",
-        },
-        "Restart": {
-            "type": "bocpd",
-            "bocpd_mode": "restart",
+        # "Standard": {
+        #     "type": "bocpd",
+        #     "bocpd_mode": "standard",
+        # },
+        # "Restart": {
+        #     "type": "bocpd",
+        #     "bocpd_mode": "restart",
+        # },
+        "MoE": {
+            "type": "moe",
+            "params": dict(
+                alpha=1.0,          # CRP 浓度，可以调
+                bf_threshold=2.0,   # log-Bayes 阈值，可以调
+                max_experts=10,     # 最多保留多少 experts
+            ),
         },
         # "Proj+BOCPD+δGP": {
         #     "type": "proj_bocpd",
@@ -208,8 +217,7 @@ def run_config2_experiment(prefix: str = "cfg2"):
             calib_cfg.bocpd.bocpd_mode = meta["bocpd_mode"]
             if meta["bocpd_mode"] == "restart":
                 calib_cfg.bocpd.use_backdated_restart = False
-                # calib_cfg.bocpd.restart_margin = 0.2
-                calib_cfg.bocpd.restart_margin = 1
+                calib_cfg.bocpd.restart_margin = 0.2
                 calib_cfg.bocpd.restart_cooldown = 2
                 calib_cfg.bocpd.use_restart = True
                 calib_cfg.bocpd.restart_threshold = 0.85
@@ -233,7 +241,7 @@ def run_config2_experiment(prefix: str = "cfg2"):
                     crps_batch = float(torch.mean(calculate_crps(Y_batch, mu, var)))
                     crps_history.append(crps_batch)
 
-                calibrator.step_batch(X_batch, Y_batch, verbose=True)
+                calibrator.step_batch(X_batch, Y_batch, verbose=False)
                 mean_theta, _ = calibrator._aggregate_particles()
                 theta_history.append(float(mean_theta.cpu().numpy()))
 
@@ -395,6 +403,54 @@ def run_config2_experiment(prefix: str = "cfg2"):
                 changepoint_times=cp_times,
             )
 
+        # ----------- 我们的新 MoE 方法 -----------
+        elif meta["type"] == "moe":
+            # 构造 MoE calibrator
+            moe = OnlineMoECalibrator(
+                calib_cfg,
+                emulator,
+                prior_sampler,
+                alpha=meta["params"].get("alpha", 1.0),
+                bf_threshold=meta["params"].get("bf_threshold", 2.0),
+                max_experts=meta["params"].get("max_experts", 10),
+            )
+
+            while total_observations < target_observations:
+                X_batch, Y_batch = stream.next()
+                batch_times_all.append(total_observations)
+
+                # 先用“上一轮 expert”做预测（第一个 batch 会走先验预测）
+                if total_observations > 0:
+                    pred = moe.predict_batch(X_batch)
+                    mu, var = pred["mu"], pred["var"]
+
+                    rmse_batch = float(torch.sqrt(torch.mean((Y_batch - mu) ** 2)))
+                    rmse_history.append(rmse_batch)
+                    crps_batch = float(torch.mean(calculate_crps(Y_batch, mu, var)))
+                    crps_history.append(crps_batch)
+                    if total_observations % 100==0:
+                        print(f"{method_name} Total observations: {total_observations}, RMSE: {rmse_batch:.4f}, CRPS: {crps_batch:.4f}")
+
+                # 再用当前 batch 的真值 + CRP 逻辑做 expert 选择和更新
+                diag = moe.step_batch(X_batch, Y_batch, verbose=True)
+
+                # 记录一下 θ 的整体 summary（兼容你原来的接口）
+                mean_theta, _ = moe._aggregate_particles()
+                if mean_theta is not None:
+                    theta_history.append(float(mean_theta.cpu().numpy()))
+                else:
+                    theta_history.append(float("nan"))
+
+                total_observations += X_batch.shape[0]
+
+            results[method_name] = dict(
+                rmse_history=rmse_history,
+                crps_history=crps_history,
+                times_rmse=batch_times_all[1:1 + len(rmse_history)],
+                changepoint_times=cp_times,
+                theta_history=theta_history,
+            )
+
     # -----------------------------------------------------
     # Plot and Save
     # -----------------------------------------------------
@@ -421,4 +477,4 @@ def run_config2_experiment(prefix: str = "cfg2"):
 # Entry point
 # -------------------------------------------------------------
 if __name__ == "__main__":
-    run_config2_experiment(prefix="cfg2_t4000")
+    run_config2_experiment(prefix="cfg3")
