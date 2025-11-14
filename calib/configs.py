@@ -64,36 +64,77 @@ class PFConfig:
 #     delta_refit_topk: int = 1  # 0 means no refit
 #     use_restart: bool = True
 
+# @dataclass
+# class BOCPDConfig:
+#     def default_hazard(r: torch.Tensor) -> torch.Tensor:
+#         """
+#         Geometric hazard: h(r) = 1 / (λ + r)
+#         期望 run-length = λ
+#         """
+#         lam = 100.0  # 期望 100 步发生一次变点
+#         return 1.0 / (lam + r)
+    
+#     # ✅ 新增：选择BOCPD模式
+#     bocpd_mode: str = "standard"  # "standard" 或 "restart"
+    
+#     hazard: Callable[[torch.Tensor], torch.Tensor] = default_hazard
+#     max_experts: int = 10  # keep top-k experts
+#     max_run_length: int = 512  # truncation for run-length posterior (advisory)
+    
+#     # ✅ Standard BOCPD 相关配置
+#     use_restart: bool = False  # 仅用于 standard mode
+#     restart_threshold: float = 0.8  # 仅用于 standard mode
+#     restart_small_r: int = 5  # 仅用于 standard mode
+    
+#     # ✅ R-BOCPD (restart_bocpd.py) 相关配置
+#     use_backdated_restart: bool = False  # False=Algorithm-2, True=Backdated
+#     restart_margin: float = 0.05  # 稳定性margin，防止频繁restart
+#     restart_cooldown: int = 10  # restart后的冷却期（步数）
+    
+#     log_space: bool = True
+#     delta_refit_every: int = 1  # 0 means never
+#     delta_refit_topk: int = 11  # 0 means no refit
+
 @dataclass
 class BOCPDConfig:
-    def default_hazard(r: torch.Tensor) -> torch.Tensor:
+    """
+    Configuration for Bayesian Online Change Point Detection (BOCPD)
+    """
+    # ==== 核心参数 ====
+    hazard_lambda: float = 100.0   # <--- 新增：可调 λ 值
+    hazard_type: str = "constant"  # <--- 可选类型：constant, linear, weibull 等
+
+    def hazard(self, r: torch.Tensor) -> torch.Tensor:
         """
-        Geometric hazard: h(r) = 1 / (λ + r)
-        期望 run-length = λ
+        Compute hazard function value h(r)
         """
-        lam = 100.0  # 期望 100 步发生一次变点
-        return 1.0 / (lam + r)
-    
-    # ✅ 新增：选择BOCPD模式
-    bocpd_mode: str = "standard"  # "standard" 或 "restart"
-    
-    hazard: Callable[[torch.Tensor], torch.Tensor] = default_hazard
-    max_experts: int = 10  # keep top-k experts
-    max_run_length: int = 10000  # truncation for run-length posterior (advisory)
-    
-    # ✅ Standard BOCPD 相关配置
-    use_restart: bool = False  # 仅用于 standard mode
-    restart_threshold: float = 0.8  # 仅用于 standard mode
-    restart_small_r: int = 5  # 仅用于 standard mode
-    
-    # ✅ R-BOCPD (restart_bocpd.py) 相关配置
-    use_backdated_restart: bool = False  # False=Algorithm-2, True=Backdated
-    restart_margin: float = 0.05  # 稳定性margin，防止频繁restart
-    restart_cooldown: int = 10  # restart后的冷却期（步数）
-    
+        lam = self.hazard_lambda
+        if self.hazard_type == "constant":
+            return torch.full_like(r, 1.0 / lam)
+        elif self.hazard_type == "linear":
+            return torch.clamp(r / lam, max=1.0)
+        elif self.hazard_type == "weibull":
+            k = 1.5  # shape parameter
+            return (k / lam) * ((r / lam) ** (k - 1))
+        elif self.hazard_type == "geometric":
+            return 1.0 / (lam + r)
+        else:
+            raise ValueError(f"Unknown hazard_type: {self.hazard_type}")
+
+    # ==== 其他参数 ====
+    bocpd_mode: str = "standard"
+    max_experts: int = 10
+    max_run_length: int = 512
+    use_restart: bool = False
+    restart_threshold: float = 0.8
+    restart_small_r: int = 5
+    use_backdated_restart: bool = False
+    restart_margin: float = 0.05
+    restart_cooldown: int = 10
     log_space: bool = True
-    delta_refit_every: int = 1  # 0 means never
-    delta_refit_topk: int = 11  # 0 means no refit
+    delta_refit_every: int = 1
+    delta_refit_topk: int = 11
+
 
 
 @dataclass
