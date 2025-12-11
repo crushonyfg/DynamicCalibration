@@ -277,7 +277,7 @@ class BOCPD:
             diags.append(diag)
 
             # mixture residual for delta GP
-            mu_eta, _ = emulator.predict(x_t.view(1, -1), e.pf.particles.theta)  # [1, N]
+            mu_eta, _ = emulator.predict(x_t.view(1, -1), e.pf.particles.theta)  # [B, N]
             w = e.pf.particles.weights().view(1, -1)
             eta_mix = (w * mu_eta).sum(dim=1).squeeze(0)
             resid = y_t - model_cfg.rho * eta_mix

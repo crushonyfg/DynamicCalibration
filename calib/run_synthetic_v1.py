@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
+import math
 
 from .configs import CalibrationConfig
 from .emulator import DeterministicSimulator
@@ -13,6 +14,8 @@ from .koh_calibrator import KOHCalibrator
 from .enhanced_data import create_config2_config, EnhancedSyntheticDataStream, EnhancedChangepointConfig
 from .projected_calibrator import BOCPDProjectedCalibrator
 from .koh_batch_calibrator import KOHBatchCalibrator
+
+from time import time
 
 # -------------------------------------------------------------
 # Global Matplotlib Setup
@@ -99,6 +102,68 @@ def plot_results(results: dict, prefix: str = "cfg2"):
     plt.savefig(f"{prefix}_rmse_crps_comparison.png", dpi=300, bbox_inches="tight")
     plt.show()
 
+def plot_history(history, prefix: str = "cfg2"):
+    times = []
+    run_length_0 = []
+    run_length_1 = []
+    mass_0 = []
+    mass_1 = []
+    theta_0 = []
+    theta_1 = []
+
+    for rec in history:
+        times.append(rec["time"])
+
+        e0 = rec["experts"][0]
+        run_length_0.append(e0["run_length"])
+        mass_0.append(e0["mass"])
+        theta_0.append(e0["theta_mean"][0])
+
+        try:
+            e1 = rec["experts"][1]
+            run_length_1.append(e1["run_length"])
+            mass_1.append(e1["mass"])
+            theta_1.append(e1["theta_mean"][0])
+        except:
+            run_length_1.append(math.nan)
+            mass_1.append(0.0)         
+            theta_1.append(math.nan)
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    t = np.array(times)
+    m0 = np.array(mass_0)
+    m1 = np.array(mass_1)
+    m1 = np.ma.masked_invalid(np.array(mass_1))
+
+    fig, ax1 = plt.subplots(figsize=(12,6))
+    rl1 = np.ma.masked_invalid(np.array(run_length_1))
+
+    # --------------------------
+    # 1) 左轴：run_length 折线
+    # --------------------------
+    ax1.plot(t, run_length_0, color="green", linewidth=2, label="Expert 0 run_length")
+    ax1.plot(t, rl1, color="red", linewidth=2, label="Expert 1 run_length")
+    ax1.set_ylabel("Run Length")
+    ax1.set_xlabel("Time step")
+    ax1.legend(loc="upper left")
+
+    # --------------------------
+    # 2) 右轴：mass 堆叠柱状图
+    # --------------------------
+    ax2 = ax1.twinx()
+    bar_width = (t[1] - t[0]) * 0.8 if len(t) > 1 else 0.8
+
+    ax2.bar(t, m0, width=bar_width, color="green", alpha=0.3, label="mass expert 0")
+    ax2.bar(t, m1, width=bar_width, bottom=m0, color="red", alpha=0.3, label="mass expert 1")
+
+    ax2.set_ylabel("Mass (stacked)")
+
+    plt.title("Experts run-length evolution + mass proportion")
+    plt.savefig(f"{prefix}_experts_history.png", dpi=300, bbox_inches="tight")
+    plt.show()    
+
 
 # -------------------------------------------------------------
 # Main Experiment Function
@@ -159,13 +224,14 @@ def run_config2_experiment(prefix: str = "cfg2"):
         #         max_opt_steps=200,
         #     ),
         # },
-        "Standard": {
-            "type": "bocpd",
-            "bocpd_mode": "standard",
-        },
+        
         "Restart": {
             "type": "bocpd",
             "bocpd_mode": "restart",
+        },
+        "Standard": {
+            "type": "bocpd",
+            "bocpd_mode": "standard",
         },
         # "Proj+BOCPD+δGP": {
         #     "type": "proj_bocpd",
@@ -193,6 +259,7 @@ def run_config2_experiment(prefix: str = "cfg2"):
     # Loop over methods
     # -----------------------------------------------------
     for method_name, meta in methods.items():
+        start_time = time()
         print(f"\n=== Running {method_name} ===")
         stream = EnhancedSyntheticDataStream(cfg2, seed=seed_fixed)
 
@@ -213,6 +280,7 @@ def run_config2_experiment(prefix: str = "cfg2"):
                 calib_cfg.bocpd.restart_cooldown = 2
                 calib_cfg.bocpd.use_restart = True
                 calib_cfg.bocpd.restart_threshold = 0.85
+                history = []
             else:
                 calib_cfg.bocpd.use_restart = True
                 calib_cfg.bocpd.restart_threshold = 0.85
@@ -220,6 +288,8 @@ def run_config2_experiment(prefix: str = "cfg2"):
             calibrator = OnlineBayesCalibrator(calib_cfg, emulator, prior_sampler)
 
             while total_observations < target_observations:
+                if total_observations % 100 == 0:
+                    print(f"{method_name} Total observations: {total_observations}")
                 X_batch, Y_batch = stream.next()
                 batch_times_all.append(total_observations)
 
@@ -233,7 +303,12 @@ def run_config2_experiment(prefix: str = "cfg2"):
                     crps_batch = float(torch.mean(calculate_crps(Y_batch, mu, var)))
                     crps_history.append(crps_batch)
 
-                calibrator.step_batch(X_batch, Y_batch, verbose=True)
+                rec = calibrator.step_batch(X_batch, Y_batch, verbose=True)
+                if meta["bocpd_mode"] == "restart":
+                    record = {"time": calibrator.bocpd.t, "experts": [{"run_length": e["run_length"], "mass": e["mass"], "theta_mean": e["theta_mean"]} for e in rec["experts_debug"]]}
+                    history.append(record)
+
+
                 mean_theta, _ = calibrator._aggregate_particles()
                 theta_history.append(float(mean_theta.cpu().numpy()))
 
@@ -257,6 +332,8 @@ def run_config2_experiment(prefix: str = "cfg2"):
             )
 
             while total_observations < target_observations:
+                if total_observations % 100 == 0:
+                    print(f"{method_name} Total observations: {total_observations}")
                 X_batch, Y_batch = stream.next()
                 X_batch = X_batch.detach().cpu().numpy()
                 Y_batch = Y_batch.detach().cpu().numpy()
@@ -395,6 +472,11 @@ def run_config2_experiment(prefix: str = "cfg2"):
                 changepoint_times=cp_times,
             )
 
+        end_time = time()
+        print(f"{method_name} Time taken: {end_time - start_time:.2f} seconds")
+        if meta["type"] == "bocpd" and meta["bocpd_mode"] == "restart":
+            plot_history(history, prefix=f"{prefix}_{method_name}")
+
     # -----------------------------------------------------
     # Plot and Save
     # -----------------------------------------------------
@@ -421,4 +503,4 @@ def run_config2_experiment(prefix: str = "cfg2"):
 # Entry point
 # -------------------------------------------------------------
 if __name__ == "__main__":
-    run_config2_experiment(prefix="cfg2_t4000")
+    run_config2_experiment(prefix="cfg2_t4000_debug")

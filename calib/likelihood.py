@@ -24,8 +24,12 @@ def predictive_stats(
         mu_tot: [b, N]
         var_tot: [b, N]
     """
-    mu = rho * mu_eta + mu_delta[:, None]
-    var = (rho**2) * var_eta + var_delta[:, None] + (sigma_eps**2)
+    try:
+        mu = rho * mu_eta + mu_delta[:, None]
+        var = (rho**2) * var_eta + var_delta[:, None] + (sigma_eps**2)
+    except:
+        mu = rho * mu_eta + mu_delta
+        var = (rho**2) * var_eta + var_delta + (sigma_eps**2)
     var = var.clamp_min(1e-12)
     return mu, var
 

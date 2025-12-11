@@ -30,7 +30,7 @@ cfg3 = DeltaKernelConfig(name="matern52", lengthscale=torch.tensor([0.3, 0.7]))
 
 @dataclass
 class PFConfig:
-    num_particles: int = 2048
+    num_particles: int = 1024
     resample_ess_ratio: float = 0.5
     resample_scheme: str = "systematic"  # or "stratified", "multinomial"
     move_strategy: str = "pmcmc"  # or "random_walk","liu_west", "laplace", "pmcmc", "none"
@@ -78,7 +78,7 @@ class BOCPDConfig:
     bocpd_mode: str = "standard"  # "standard" 或 "restart"
     
     hazard: Callable[[torch.Tensor], torch.Tensor] = default_hazard
-    max_experts: int = 10  # keep top-k experts
+    max_experts: int = 5  # keep top-k experts
     max_run_length: int = 10000  # truncation for run-length posterior (advisory)
     
     # ✅ Standard BOCPD 相关配置

@@ -21,8 +21,9 @@ def my_restart_hook(t_now, r_new, s_star, anchor_rl, p_anchor, best_other):
 
 from .bocpd import BOCPD as StandardBOCPD
 # from .restart_bocpd import BOCPD as RestartBOCPD
-# from .restart_bocpd_debug import BOCPD as RestartBOCPD
-from .restart_bocpd_mbr import BOCPD as RestartBOCPD
+from .restart_bocpd_debug import BOCPD as RestartBOCPD
+# from .restart_bocpd_mbr import BOCPD as RestartBOCPD
+# from .restart_bocpd_mod import BOCPD as RestartBOCPD
 
 
 class OnlineBayesCalibrator:
@@ -118,7 +119,16 @@ class OnlineBayesCalibrator:
         for e in self.bocpd.experts:
             w_e = math.exp(e.log_mass)
             mu_eta, var_eta = self.emulator.predict(X_batch, e.pf.particles.theta)  # [batch_size, N]
-            mu_delta, var_delta = e.delta_state.predict(X_batch)  # [batch_size]
+            try:
+                mu_delta, var_delta = e.delta_state.predict(X_batch)  # [batch_size]
+            except:
+                mu_deltas, var_deltas = [], []
+                for delta_state in e.delta_states:
+                    mu_delta, var_delta = delta_state.predict(X_batch)  # [batch_size]
+                    mu_deltas.append(mu_delta)
+                    var_deltas.append(var_delta)
+                mu_delta = torch.stack(mu_deltas, dim=1).mean(dim=1)
+                var_delta = torch.stack(var_deltas, dim=1).mean(dim=1)
             mu, var = predictive_stats(self.cfg.model.rho, mu_eta, var_eta, mu_delta, var_delta, self.cfg.model.sigma_eps)
             w = e.pf.particles.weights()[None, :]
             mu_mix = (w * mu).sum(dim=1)  # [batch_size]
