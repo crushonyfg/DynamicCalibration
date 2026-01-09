@@ -231,19 +231,19 @@ def run_config2_experiment(prefix: str = "cfg2"):
 
     # -------- Methods definition --------
     methods = {
-        # "KOH": {
-        #     "type": "koh",
-        #     "params": dict(
-        #         update_mode="full",
-        #         window_length=800,
-        #         lengthscale=0.3,
-        #         variance=1.0,
-        #         noise_var=0.04,
-        #         optimize_theta=True,
-        #         optimize_hypers=True,
-        #         max_opt_steps=200,
-        #     ),
-        # },
+        "KOH": {
+            "type": "koh",
+            "params": dict(
+                update_mode="full",
+                window_length=200,
+                lengthscale=0.3,
+                variance=1.0,
+                noise_var=0.04,
+                optimize_theta=True,
+                optimize_hypers=True,
+                max_opt_steps=200,
+            ),
+        },
         "Standard": {
             "type": "bocpd",
             "bocpd_mode": "standard",
@@ -353,7 +353,7 @@ def run_config2_experiment(prefix: str = "cfg2"):
             while total_observations < target_observations:
                 if total_observations % 100 == 0:
                     print(f"{method_name} Total observations: {total_observations}")
-                X_batch, Y_batch = stream.next()
+                X_batch, Y_batch = stream.next(batch_size)
                 X_batch = X_batch.detach().cpu().numpy()
                 Y_batch = Y_batch.detach().cpu().numpy()
                 batch_times_all.append(total_observations)

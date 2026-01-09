@@ -96,12 +96,12 @@ data = np.load(f"{prefix}_results_summary.npz", allow_pickle=True)
 # 提取三种方法的 θ 历史
 theta_std = data["Standard_theta"]
 theta_rst = data["Restart_theta"]
-# theta_koh = data["KOH_theta"]
+theta_koh = data["KOH_theta"]
 
 # 时间轴（每 batch 40 个点）
 times_std = data["Standard_times"]
 times_rst = data["Restart_times"]
-# times_koh = data["KOH_times"]
+times_koh = data["KOH_times"]
 times_std = np.concatenate(([0], times_std))
 times_std = times_std + 40
 # theta_std = np.concatenate(([theta_std[0]], theta_std))
@@ -134,6 +134,7 @@ plt.figure(figsize=(10, 6))
 
 plt.plot(times_std, theta_std, label="Standard BOCPD", lw=2)
 plt.plot(times_std, theta_rst, label="Restart BOCPD", lw=2)
+plt.plot(times_std, theta_koh, label="KOH Calibration", lw=2)
 plt.plot(times_std, theta_oracle, label="Oracle θ*(t)", lw=3, color="black")
 
 # changepoints
