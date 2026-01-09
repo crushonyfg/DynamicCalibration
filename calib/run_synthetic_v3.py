@@ -11,7 +11,7 @@ from .configs import CalibrationConfig
 from .emulator import DeterministicSimulator
 from .online_calibrator import OnlineBayesCalibrator
 from .koh_calibrator import KOHCalibrator
-from .enhanced_data import create_config2_config, EnhancedSyntheticDataStream, EnhancedChangepointConfig
+from .enhanced_data import create_config2_config, EnhancedSyntheticDataStream1, EnhancedChangepointConfig
 from .projected_calibrator import BOCPDProjectedCalibrator
 from .koh_batch_calibrator import KOHBatchCalibrator
 
@@ -23,6 +23,20 @@ from time import time
 rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'SimSun', 'Arial Unicode MS']
 rcParams['axes.unicode_minus'] = False
 
+def theta_true_schedule(t):
+    """
+    t: observation index (0 ... T)
+    returns true a2 parameter
+    """
+    if t < 1600:
+        # 7.5 -> 12 (linear drift)
+        return 7.5 + (12.0 - 7.5) * (t / 1600)
+    elif t < 2000:
+        # abrupt drop to 5
+        return 5.0
+    else:
+        # 5 -> 7.5 (slow drift)
+        return 5.0 + (7.5 - 5.0) * ((t - 2000) / (4000 - 2000))
 
 # -------------------------------------------------------------
 # Utility Functions
@@ -194,12 +208,17 @@ def run_config2_experiment(prefix: str = "cfg2"):
         batch_size_range=(batch_size, batch_size),
     )
     cp_times = [800, 1600, 2400, 3200]
+    # cfg2.changepoints = [
+    #     EnhancedChangepointConfig(time=cp_times[0], phys_param_new=torch.tensor([5, 5, 5], dtype=dtype, device=device)),
+    #     EnhancedChangepointConfig(time=cp_times[1], phys_param_new=torch.tensor([5, 12, 5], dtype=dtype, device=device)),
+    #     EnhancedChangepointConfig(time=cp_times[2], phys_param_new=torch.tensor([5, 7.0, 5], dtype=dtype, device=device)),
+    #     EnhancedChangepointConfig(time=cp_times[3], phys_param_new=torch.tensor([5, 11, 5], dtype=dtype, device=device)),
+    # ]
     cfg2.changepoints = [
-        EnhancedChangepointConfig(time=cp_times[0], phys_param_new=torch.tensor([5, 5, 5], dtype=dtype, device=device)),
-        EnhancedChangepointConfig(time=cp_times[1], phys_param_new=torch.tensor([5, 12, 5], dtype=dtype, device=device)),
-        EnhancedChangepointConfig(time=cp_times[2], phys_param_new=torch.tensor([5, 7.0, 5], dtype=dtype, device=device)),
-        EnhancedChangepointConfig(time=cp_times[3], phys_param_new=torch.tensor([5, 11, 5], dtype=dtype, device=device)),
+        EnhancedChangepointConfig(time=1600, phys_param_new=torch.tensor([5, 5.0, 5])),
+        EnhancedChangepointConfig(time=2000, phys_param_new=None),
     ]
+
     seed_fixed = 123
 
     # --------- 先验 θ ∈ [0,3] ----------
@@ -261,7 +280,7 @@ def run_config2_experiment(prefix: str = "cfg2"):
     for method_name, meta in methods.items():
         start_time = time()
         print(f"\n=== Running {method_name} ===")
-        stream = EnhancedSyntheticDataStream(cfg2, seed=seed_fixed)
+        stream = EnhancedSyntheticDataStream1(cfg2, seed=seed_fixed)
 
         prediction_errors = []
         rmse_history = []
@@ -290,7 +309,7 @@ def run_config2_experiment(prefix: str = "cfg2"):
             while total_observations < target_observations:
                 if total_observations % 100 == 0:
                     print(f"{method_name} Total observations: {total_observations}")
-                X_batch, Y_batch = stream.next()
+                X_batch, Y_batch = stream.next(batch_size)
                 batch_times_all.append(total_observations)
 
                 if total_observations > 0:
@@ -503,4 +522,4 @@ def run_config2_experiment(prefix: str = "cfg2"):
 # Entry point
 # -------------------------------------------------------------
 if __name__ == "__main__":
-    run_config2_experiment(prefix="cfg2_t4000_debug_26010802_40_batch_compareBatchOnly")
+    run_config2_experiment(prefix="cfg2_t4000_debug_26010803_40_batch_compareBatch")

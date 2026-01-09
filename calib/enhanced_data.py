@@ -304,6 +304,145 @@ class EnhancedSyntheticDataStream:
         
         return X, Y
 
+class EnhancedSyntheticDataStream1:
+    """
+    Enhanced synthetic data stream supporting:
+    - abrupt changepoints
+    - continuous parameter drift within regimes
+    """
+
+    def __init__(self, cfg: EnhancedSyntheticConfig, seed: Optional[int] = None):
+        self.cfg = cfg
+        self.physical_cfg = cfg.physical_config
+
+        self.rng = torch.Generator().manual_seed(seed or 0)
+
+        # ---- time & state ----
+        self.t = 0
+        self.theta_current = self.physical_cfg.theta_optimal.clone()
+        self.current_physical_system = self.physical_cfg.physical_system
+        self.current_noise_variance = self.physical_cfg.noise_variance
+
+        if self.physical_cfg.phys_param_dim > 0:
+            self.phys_param_current = self.physical_cfg.phys_param_init.clone()
+        else:
+            self.phys_param_current = None
+
+        # 当前 regime（由 changepoint 决定）
+        self.current_regime = 0
+        self.processed_changepoints = set()
+
+        # fixed-x support
+        if self.physical_cfg.sampling_strategy == "fixed" and self.physical_cfg.fixed_x_values:
+            self.fixed_x_values = torch.tensor(
+                self.physical_cfg.fixed_x_values, dtype=torch.float64
+            )
+        else:
+            self.fixed_x_values = None
+
+    # =========================================================
+    #  NEW: continuous drift model for phys_param
+    # =========================================================
+    def _update_physical_param_drift(self, t: int):
+        """
+        Continuous drift of physical parameters within each regime.
+        Hard-coded example for config2:
+            regime 0: a2 from 7.5 -> 12
+            regime 1: fixed at 5
+            regime 2: a2 from 5 -> 7.5
+        """
+        if self.current_physical_system != "config2":
+            return
+
+        # phys_param_current = [a1, a2, a3]
+        a1, a2, a3 = self.phys_param_current
+
+        if self.current_regime == 0:
+            # 7.5 -> 12 over t in [0, 1600)
+            a2_new = 7.5 + (12.0 - 7.5) * min(t / 1600.0, 1.0)
+
+        elif self.current_regime == 1:
+            # flat at 5
+            a2_new = 5.0
+
+        elif self.current_regime == 2:
+            # 5 -> 7.5 over t in [2000, 4000)
+            a2_new = 5.0 + (7.5 - 5.0) * min((t - 2000) / 2000.0, 1.0)
+
+        else:
+            a2_new = a2
+
+        self.phys_param_current = torch.tensor(
+            [a1, a2_new, a3],
+            dtype=self.phys_param_current.dtype,
+            device=self.phys_param_current.device,
+        )
+
+    # =========================================================
+    # computer / physical systems (unchanged)
+    # =========================================================
+    def _computer_model(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        if self.physical_cfg.computer_model == "config2":
+            return torch.sin(5 * theta[0] * x) + 5 * x
+        raise ValueError
+
+    def _physical_system(self, x: torch.Tensor) -> torch.Tensor:
+        if self.current_physical_system == "config2":
+            a1, a2, a3 = self.phys_param_current
+            return a1 * x * torch.cos(a2 * x) + a3 * x
+        raise ValueError
+
+    def _sample_x(self, n: int) -> torch.Tensor:
+        return torch.rand(n, 1, dtype=torch.float64, generator=self.rng)
+
+    # =========================================================
+    #  Changepoint now switches REGIME, not just value
+    # =========================================================
+    def _check_changepoints(self, t_current: int):
+        for cp in self.cfg.changepoints:
+            if cp.time == t_current and cp.time not in self.processed_changepoints:
+                print(f"\n🔄 [t={t_current}] Changepoint!")
+
+                # 切换 regime
+                self.current_regime += 1
+                print(f"   Regime switched → {self.current_regime}")
+
+                # 可选：hard reset φ
+                if cp.phys_param_new is not None:
+                    self.phys_param_current = cp.phys_param_new.clone()
+                    print(f"   φ hard reset → {self.phys_param_current.cpu().numpy()}")
+
+                self.processed_changepoints.add(cp.time)
+
+    # =========================================================
+    #  Main generator
+    # =========================================================
+    def next(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        X_list, Y_list = [], []
+
+        for _ in range(batch_size):
+            # check cp
+            self._check_changepoints(self.t)
+
+            # update continuous drift
+            self._update_physical_param_drift(self.t)
+
+            # sample
+            x = self._sample_x(1)
+            eta = self._physical_system(x).squeeze()
+            eps = torch.sqrt(torch.tensor(self.current_noise_variance)) * \
+                  torch.randn((), generator=self.rng)
+
+            X_list.append(x)
+            Y_list.append(eta + eps)
+
+            self.t += 1
+
+        X = torch.cat(X_list, dim=0)
+        Y = torch.stack(Y_list)
+
+        return X, Y
+
 
 # 预定义的配置工厂函数
 def create_config1_config(

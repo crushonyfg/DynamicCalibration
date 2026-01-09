@@ -25,7 +25,9 @@ def best_theta_on_segment(a2, theta_lo=0.05, theta_hi=3.0, n_grid=2001):
     return th_star, thetas, errs
 
 # ---------- 五个分段频率 ----------
-prefix = "cfg2"  # 改成你的实验前缀
+# prefix = "cfg2_t4000_debug_26010802_40_batch_restart"  # 改成你的实验前缀
+# prefix = "cfg2_t4000_mod"
+prefix = "cfg2_t4000_debug_26010802_40_batch_compareBatchonly"
 a2_list = [7.5, 5.0, 12.0, 7.0, 11.0]
 theta_stars = []
 all_curves = []
@@ -94,13 +96,16 @@ data = np.load(f"{prefix}_results_summary.npz", allow_pickle=True)
 # 提取三种方法的 θ 历史
 theta_std = data["Standard_theta"]
 theta_rst = data["Restart_theta"]
-theta_koh = data["KOH_theta"]
+# theta_koh = data["KOH_theta"]
 
 # 时间轴（每 batch 40 个点）
 times_std = data["Standard_times"]
 times_rst = data["Restart_times"]
-times_koh = data["KOH_times"]
+# times_koh = data["KOH_times"]
 times_std = np.concatenate(([0], times_std))
+times_std = times_std + 40
+# theta_std = np.concatenate(([theta_std[0]], theta_std))
+# theta_rst = np.concatenate(([theta_rst[0]], theta_rst))
 
 
 # ============================================================
@@ -116,7 +121,7 @@ cp_times = [800, 1600, 2400, 3200]
 plt.figure(figsize=(10, 6))
 plt.plot(times_std, theta_std, label="Standard BOCPD", lw=2)
 plt.plot(times_std, theta_rst, label="Restart BOCPD", lw=2)
-plt.plot(times_std, theta_koh, label="KOH Calibration", lw=2)
+# plt.plot(times_std, theta_koh, label="KOH Calibration", lw=2)
 
 # changepoints（竖线）
 for cp in cp_times:
@@ -125,6 +130,7 @@ for cp in cp_times:
 # 每段真实 θ*（水平线）
 for i, th_star in enumerate(theta_stars):
     x0 = 0 if i == 0 else cp_times[i-1]
+    # x0 = cp_times[i-1]
     x1 = cp_times[i] if i < len(cp_times) else max(times_std)
     plt.hlines(th_star, x0, x1, colors='#555555', linestyles='dashed', lw=3, alpha=0.9)
 

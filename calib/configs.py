@@ -101,8 +101,8 @@ class BOCPDConfig:
     Configuration for Bayesian Online Change Point Detection (BOCPD)
     """
     # ==== 核心参数 ====
-    hazard_lambda: float = 100.0   # <--- 新增：可调 λ 值
-    hazard_type: str = "constant"  # <--- 可选类型：constant, linear, weibull 等
+    hazard_lambda: float = 1600.0   # <--- 新增：可调 λ 值
+    hazard_type: str = "geometric"  # <--- 可选类型：constant, linear, weibull 等
 
     def hazard(self, r: torch.Tensor) -> torch.Tensor:
         """
@@ -124,7 +124,7 @@ class BOCPDConfig:
     # ==== 其他参数 ====
     bocpd_mode: str = "standard"
     max_experts: int = 5
-    max_run_length: int = 512
+    max_run_length: int = 1000000
     use_restart: bool = False
     restart_threshold: float = 0.8
     restart_small_r: int = 5
@@ -145,6 +145,7 @@ class ModelConfig:
         name="rbf",
         lengthscale=1.0,
         variance=0.01,  # ✅ 设置为0，禁用delta
+        # noise=1e-6,
         noise=1e-6
     ))
     emulator_type: str = "deterministic"  # or "gp"

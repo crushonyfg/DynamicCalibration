@@ -1101,31 +1101,32 @@ class BOCPD:
                 update_mode="exact_full",
                 hyperparam_mode="fit",
             )
+            e.delta_state.refit_hyperparams()
         # print(f"check the delta_state.X.shape: {self.experts[0].delta_state.X.shape}, e.X_hist.shape: {self.experts[0].X_hist.shape}")
 
         # 5) delta refit
         self.t += batch_size
-        did_refit = False
-        if (
-            self.delta_fitter is not None
-            and self.delta_refit_every > 0
-            and (self.t % self.delta_refit_every == 0)
-        ):
-            topk = min(self.delta_refit_topk, len(self.experts))
-            topk_indices: List[int] = []
-            for i in range(topk):
-                if self.experts[i].X_hist.shape[0] >= 10:
-                    topk_indices.append(i)
-            if topk_indices:
-                _ = self.delta_fitter.refit_topk(
-                    experts=self.experts,
-                    emulator=emulator,
-                    rho=model_cfg.rho,
-                    sigma_eps=model_cfg.sigma_eps,
-                    topk_indices=topk_indices,
-                    init_from_current=True,
-                )
-                did_refit = True
+        # did_refit = False
+        # if (
+        #     self.delta_fitter is not None
+        #     and self.delta_refit_every > 0
+        #     and (self.t % self.delta_refit_every == 0)
+        # ):
+        #     topk = min(self.delta_refit_topk, len(self.experts))
+        #     topk_indices: List[int] = []
+        #     for i in range(topk):
+        #         if self.experts[i].X_hist.shape[0] >= 10:
+        #             topk_indices.append(i)
+        #     if topk_indices:
+        #         _ = self.delta_fitter.refit_topk(
+        #             experts=self.experts,
+        #             emulator=emulator,
+        #             rho=model_cfg.rho,
+        #             sigma_eps=model_cfg.sigma_eps,
+        #             topk_indices=topk_indices,
+        #             init_from_current=True,
+        #         )
+        #         did_refit = True
 
         masses_np = [math.exp(e.log_mass) for e in self.experts]
         entropy = -sum(m * math.log(m + 1e-12) for m in masses_np)
@@ -1175,7 +1176,7 @@ class BOCPD:
             "num_experts": len(self.experts),
             "experts_log_mass": [float(e.log_mass) for e in self.experts],
             "pf_diags": pf_diags,
-            "did_delta_refit": did_refit,
+            # "did_delta_refit": did_refit,
             "did_restart": did_restart,
             "restart_start_time": int(self.restart_start_time),
             "s_star": int(s_star) if s_star is not None else None,

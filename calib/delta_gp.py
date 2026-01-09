@@ -26,7 +26,8 @@ class OnlineGPState:
     X: torch.Tensor  # [t, dx]
     y: torch.Tensor  # [t]
     kernel: Kernel
-    noise: float
+    # noise: float
+    noise: Union[float, torch.Tensor]
     update_mode: Literal['exact_full', 'exact_rank1', 'sparse_inducing'] = 'exact_rank1'
     hyperparam_mode: Literal['fixed', 'fit'] = 'fixed'
     cache: Dict[str, Any] = field(default_factory=dict)
@@ -35,7 +36,12 @@ class OnlineGPState:
     # --- internal helpers ---
     def _kernel_matrix(self, X: torch.Tensor) -> torch.Tensor:
         K = self.kernel.cov(X, X)
-        K = K + (self.noise + 1e-8) * torch.eye(X.shape[0], dtype=X.dtype, device=X.device)
+        t = X.shape[0]
+        if isinstance(self.noise, torch.Tensor):
+            jitter = 1e-8
+            K = K + torch.diag(self.noise.to(X.device, X.dtype)+jitter)
+        else:
+            K = K + (self.noise + 1e-8) * torch.eye(t, dtype=X.dtype, device=X.device)
         return K
 
     def _recompute_cache_full(self) -> None:
@@ -69,7 +75,10 @@ class OnlineGPState:
         L = self.cache["L"]  # [t,t]
 
         k = self.kernel.cov(x_new[None, :], X_old).squeeze(0)  # [t]
-        kxx = self.kernel.cov(x_new[None, :], x_new[None, :]).squeeze() + (self.noise + 1e-8)
+        if isinstance(self.noise, torch.Tensor):
+            kxx = self.kernel.cov(x_new[None, :], x_new[None, :]).squeeze() + torch.diag(self.noise.to(x_new.device, x_new.dtype)+1e-8)
+        else:
+            kxx = self.kernel.cov(x_new[None, :], x_new[None, :]).squeeze() + (self.noise + 1e-8)
 
         v = torch.linalg.solve_triangular(L, k[:, None], upper=False).squeeze(-1)
         residual_var = kxx - (v @ v)

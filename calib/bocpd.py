@@ -396,6 +396,22 @@ class BOCPD:
                 update_mode="exact_full",
                 hyperparam_mode="fit",
             )
+            # mu_eta_all, _ = emulator.predict(X_batch, e.pf.particles.theta)  # shape [M, N]
+            # weights = e.pf.particles.weights().view(1, -1)  # [1, N]
+            # eta_mix_all = (weights * mu_eta_all).sum(dim=1)  # [M]
+            # resid_all = Y_batch - model_cfg.rho * eta_mix_all
+
+            # # 3. 完全重写 delta_state
+            # e.delta_state = OnlineGPState(
+            #     X=X_batch,
+            #     y=resid_all,
+            #     kernel=make_kernel(model_cfg.delta_kernel),
+            #     noise=model_cfg.delta_kernel.noise,
+            #     update_mode="exact_full",
+            #     hyperparam_mode="fit",
+            # )
+            
+            e.delta_state.refit_hyperparams()
 
         # 7) 其他逻辑保持不变...
         self.t += batch_size
