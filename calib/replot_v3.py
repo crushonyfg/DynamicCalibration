@@ -27,7 +27,9 @@ def best_theta_on_segment(a2, theta_lo=0.05, theta_hi=3.0, n_grid=2001):
 # ---------- 五个分段频率 ----------
 # prefix = "cfg2_t4000_debug_26010802_40_batch_restart"  # 改成你的实验前缀
 # prefix = "cfg2_t4000_mod"
-prefix = "cfg2_t4000_debug_26010803_40_batch_compareBatch"
+# prefix = "cfg2_t4000_debug_26010803_40_batch_compareBatch"
+# prefix="cfg2_26011501_40_allnewdataset"
+prefix="cfg2_260121_20_1000total_v3_trytheta"
 # a2_list = [7.5, 5.0, 12.0, 7.0, 11.0]
 # theta_stars = []
 # all_curves = []
@@ -94,32 +96,47 @@ import matplotlib.pyplot as plt
 data = np.load(f"{prefix}_results_summary.npz", allow_pickle=True)
 
 # 提取三种方法的 θ 历史
-theta_std = data["Standard_theta"]
-theta_rst = data["Restart_theta"]
-theta_koh = data["KOH_theta"]
+# theta_std = data["Standard_theta"]
+# theta_rst = data["Restart_theta"]
+# theta_koh = data["KOH_theta"]
 
-# 时间轴（每 batch 40 个点）
-times_std = data["Standard_times"]
-times_rst = data["Restart_times"]
-times_koh = data["KOH_times"]
-times_std = np.concatenate(([0], times_std))
-times_std = times_std + 40
+# # 时间轴（每 batch 40 个点）
+# times_std = data["Standard_times"]
+# times_rst = data["Restart_times"]
+# times_koh = data["KOH_times"]
+plt.figure(figsize=(10, 6))
+method_names = sorted(
+    key[:-6]                      
+    for key in data.keys()
+    if key.endswith("_theta")
+)
+
+for method_name in method_names:
+    theta_history = data[f"{method_name}_theta"]
+    times_history = data[f"{method_name}_times"]
+    times_std = np.concatenate(([0], times_history))
+    times_std = times_std + 40
+    plt.plot(times_std, theta_history, label=method_name, lw=2)
+
+# times_std = np.concatenate(([0], times_std))
+# times_std = times_std + 40
 # theta_std = np.concatenate(([theta_std[0]], theta_std))
 # theta_rst = np.concatenate(([theta_rst[0]], theta_rst))
 # ============================================================
 # oracle θ*(t)
 # ============================================================
-def a2_schedule(t):
-    if t < 1600:
-        return 7.5 + (12.0 - 7.5) * (t / 1600.0)
-    elif t < 2000:
+def a2_schedule(t, t1, t2):
+    if t < t1:
+        return 7.5 + (12.0 - 7.5) * (t / t1)
+    elif t < t2:
         return 5.0
     else:
-        return 5.0 + (7.5 - 5.0) * ((t - 2000) / 2000.0)
+        return 5.0 + (7.5 - 5.0) * ((t - t2) / t2)
 
+t1, t2 = 400.0, 500.0
 def best_theta_at_time(t):
-    a2 = a2_schedule(t)
-    x = np.linspace(0.0, 1.0, 800)
+    a2 = a2_schedule(t, t1, t2)
+    x = np.linspace(0.0, 1.0, 1000)
     yt = y_true_np(x, a2)
     thetas = np.linspace(0.05, 3.0, 1001)
     errs = [(np.mean((yt - y_sim_np(x, th))**2)) for th in thetas]
@@ -130,15 +147,15 @@ theta_oracle = np.array([best_theta_at_time(t) for t in times_std])
 # ============================================================
 # plot
 # ============================================================
-plt.figure(figsize=(10, 6))
+# plt.figure(figsize=(10, 6))
 
-plt.plot(times_std, theta_std, label="Standard BOCPD", lw=2)
-plt.plot(times_std, theta_rst, label="Restart BOCPD", lw=2)
-plt.plot(times_std, theta_koh, label="KOH Calibration", lw=2)
+# plt.plot(times_std, theta_std, label="Standard BOCPD", lw=2)
+# plt.plot(times_std, theta_rst, label="Restart BOCPD", lw=2)
+# plt.plot(times_std, theta_koh, label="KOH Calibration", lw=2)
 plt.plot(times_std, theta_oracle, label="Oracle θ*(t)", lw=3, color="black")
 
 # changepoints
-for cp in [1600, 2000]:
+for cp in [t1, t2]:
     plt.axvline(cp, color='red', linestyle='--', alpha=0.6)
 
 plt.xlabel("Observation Time (t)")

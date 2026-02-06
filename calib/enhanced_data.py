@@ -31,7 +31,7 @@ class PhysicalSystemConfig:
     
     # 采样参数
     n_observations: int = 50  # 观测数量
-    sampling_strategy: str = "uniform"  # "uniform", "equidistant", "fixed"
+    sampling_strategy: str = "lhs"  # "uniform", "equidistant", "fixed", "lhs"
     fixed_x_values: Optional[List[float]] = None  # 固定x值（用于config3）
 
     phys_param_dim: int = 0
@@ -165,6 +165,9 @@ class EnhancedSyntheticDataStream:
                 dtype=torch.float64
             )
             return x_values.unsqueeze(-1)
+
+        elif self.physical_cfg.sampling_strategy == "lhs":
+            return self._sample_x_lhs(n)
             
         elif self.physical_cfg.sampling_strategy == "fixed":
             # 固定值采样（用于config3）
@@ -211,6 +214,33 @@ class EnhancedSyntheticDataStream:
 
                 self.processed_changepoints.add(cp.time)
                 print()
+
+    def _sample_x_lhs(self, n: int) -> torch.Tensor:
+        """
+        Latin Hypercube / stratified sampling in 1D.
+        - 每个 batch 内均匀覆盖 [low, high]
+        - batch 间随机
+        """
+        low, high = self.physical_cfg.design_space
+
+        # n 个区间
+        edges = torch.linspace(
+            low, high, n + 1, dtype=torch.float64
+        )
+
+        # 每个区间内采一个点
+        u = torch.empty(n, dtype=torch.float64)
+        for i in range(n):
+            u[i] = edges[i] + (edges[i + 1] - edges[i]) * torch.rand(
+                (), generator=self.rng, dtype=torch.float64
+            )
+
+        # 打乱顺序（LHS 关键）
+        perm = torch.randperm(n, generator=self.rng)
+        u = u[perm]
+
+        return u.unsqueeze(-1)
+
     
     def _inject_additional_noise(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         """注入额外的噪声（异常值和异方差）"""
@@ -311,9 +341,11 @@ class EnhancedSyntheticDataStream1:
     - continuous parameter drift within regimes
     """
 
-    def __init__(self, cfg: EnhancedSyntheticConfig, seed: Optional[int] = None):
+    def __init__(self, cfg: EnhancedSyntheticConfig, seed: Optional[int] = None, output_a2: bool = False):
         self.cfg = cfg
         self.physical_cfg = cfg.physical_config
+
+        self.output_a2 = output_a2
 
         self.rng = torch.Generator().manual_seed(seed or 0)
 
@@ -343,7 +375,7 @@ class EnhancedSyntheticDataStream1:
     # =========================================================
     #  NEW: continuous drift model for phys_param
     # =========================================================
-    def _update_physical_param_drift(self, t: int):
+    def _update_physical_param_drift(self, t: int, t1: int, t2: int):
         """
         Continuous drift of physical parameters within each regime.
         Hard-coded example for config2:
@@ -359,7 +391,7 @@ class EnhancedSyntheticDataStream1:
 
         if self.current_regime == 0:
             # 7.5 -> 12 over t in [0, 1600)
-            a2_new = 7.5 + (12.0 - 7.5) * min(t / 1600.0, 1.0)
+            a2_new = 7.5 + (12.0 - 7.5) * min(t / t1, 1.0)
 
         elif self.current_regime == 1:
             # flat at 5
@@ -367,7 +399,7 @@ class EnhancedSyntheticDataStream1:
 
         elif self.current_regime == 2:
             # 5 -> 7.5 over t in [2000, 4000)
-            a2_new = 5.0 + (7.5 - 5.0) * min((t - 2000) / 2000.0, 1.0)
+            a2_new = 5.0 + (7.5 - 5.0) * min((t - t2) / t2, 1.0)
 
         else:
             a2_new = a2
@@ -377,6 +409,7 @@ class EnhancedSyntheticDataStream1:
             dtype=self.phys_param_current.dtype,
             device=self.phys_param_current.device,
         )
+        return a2_new
 
     # =========================================================
     # computer / physical systems (unchanged)
@@ -425,7 +458,8 @@ class EnhancedSyntheticDataStream1:
             self._check_changepoints(self.t)
 
             # update continuous drift
-            self._update_physical_param_drift(self.t)
+            drift_start, drift_end = self.cfg.changepoints[0].time, self.cfg.changepoints[1].time
+            a2_new = self._update_physical_param_drift(self.t, drift_start, drift_end)
 
             # sample
             x = self._sample_x(1)
@@ -441,7 +475,10 @@ class EnhancedSyntheticDataStream1:
         X = torch.cat(X_list, dim=0)
         Y = torch.stack(Y_list)
 
-        return X, Y
+        if self.output_a2:
+            return X, Y, a2_new
+        else:
+            return X, Y
 
 
 # 预定义的配置工厂函数
@@ -492,7 +529,9 @@ def create_config2_config(
         theta_optimal=theta_optimal,
         noise_variance=noise_variance,
         n_observations=n_observations,
-        sampling_strategy="equidistant",
+        # sampling_strategy="equidistant",
+        sampling_strategy="lhs",
+        # sampling_strategy="uniform",
         # φ = [a1, a2, a3]，默认 [5, 15/2, 5]
         phys_param_dim=3,
         phys_param_init=torch.tensor([5.0, 7.5, 5.0], dtype=torch.float64),

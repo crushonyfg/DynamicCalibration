@@ -402,3 +402,47 @@ class BOCPDProjectedCalibrator:
     def _as2d(self, X: Tensor) -> Tensor:
         X = X.detach().to(self.device, self.dtype)
         return X if X.ndim == 2 else X[:, None]
+
+if __name__ == "__main__":
+    def simulator(X, theta):
+        # X: [B,1], theta: [1,p] or [B,p], assume p=1
+        return X * theta[:, :1]   # output [B,1]
+    def make_fake_expert(device="cpu", dtype=torch.float32):
+        X = torch.rand(30, 1, device=device, dtype=dtype)
+        y = torch.sin(2 * torch.pi * X) + 0.1 * torch.randn_like(X)
+
+        exp = YHatExpert(
+            device=device, dtype=dtype,
+            update_mode="full",
+            window_length=200,
+            fit_iters=50
+        )
+        exp.append(X, y)
+        exp.refit()
+        return exp
+    experts = [make_fake_expert() for _ in range(2)]
+    theta_lo = torch.tensor([0.0])
+    theta_hi = torch.tensor([3.0])
+    solver = ThetaSolver(
+        simulator=simulator,
+        theta_bounds=(theta_lo, theta_hi),
+        n_theta_samples=16,
+        n_restart=3,
+        delta_update_mode="full",
+        delta_fit_iters=50
+    )
+    theta_true = torch.tensor([[1.5]])
+    X_hist = torch.rand(50, 1)
+    y_hist = simulator(X_hist, theta_true) + 0.05 * torch.randn_like(X_hist)
+    solver.project_and_fit_delta(
+        exp=experts[0],
+        X_hist=X_hist,
+        y_hist=y_hist
+    )
+    X_new = torch.linspace(0, 1, 100).reshape(-1,1)
+    pred = solver.predict(X_new)
+
+    print("mu shape:", pred["mu"].shape)
+    print("var shape:", pred["var"].shape)
+
+

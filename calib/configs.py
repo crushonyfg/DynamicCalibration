@@ -33,7 +33,8 @@ class PFConfig:
     num_particles: int = 1024
     resample_ess_ratio: float = 0.5
     resample_scheme: str = "systematic"  # or "stratified", "multinomial"
-    move_strategy: str = "pmcmc"  # or "random_walk","liu_west", "laplace", "pmcmc", "none"
+    # move_strategy: str = "pmcmc"  # or "random_walk","liu_west", "laplace", "pmcmc", "none"
+    move_strategy: str = "random_walk"
     # Liu–West hyperparams
     liu_west_a: float = 0.90
     liu_west_h2: Optional[float] = None  # if None, derive from a via h^2 = 1-a^2
@@ -101,7 +102,7 @@ class BOCPDConfig:
     Configuration for Bayesian Online Change Point Detection (BOCPD)
     """
     # ==== 核心参数 ====
-    hazard_lambda: float = 1600.0   # <--- 新增：可调 λ 值
+    hazard_lambda: float = 200   # <--- 新增：可调 λ 值
     hazard_type: str = "geometric"  # <--- 可选类型：constant, linear, weibull 等
 
     def hazard(self, r: torch.Tensor) -> torch.Tensor:
@@ -126,14 +127,24 @@ class BOCPDConfig:
     max_experts: int = 5
     max_run_length: int = 1000000
     use_restart: bool = False
-    restart_threshold: float = 0.8
+    restart_threshold: float = 0.85
     restart_small_r: int = 5
     use_backdated_restart: bool = False
-    restart_margin: float = 0.05
+    restart_margin: float = 1
     restart_cooldown: int = 10
     log_space: bool = True
     delta_refit_every: int = 1
     delta_refit_topk: int = 11
+    use_restart: bool = True
+
+    restart_criteria: str = "rank_change" # "theta_test" or "rank_change"
+    restart_theta_test: str = "energy" # or "credible" or "sw" or "energy"
+    restart_cred_z: float = 2.0
+    restart_cred_frac: float = 0.5
+    restart_sw_proj: int = 32
+    restart_theta_tau: float = 0.5
+
+
 
 
 
@@ -151,6 +162,7 @@ class ModelConfig:
     emulator_type: str = "deterministic"  # or "gp"
     device: str = "cpu"
     dtype: torch.dtype = torch.float64
+    use_discrepancy: bool = True
 
 
 @dataclass

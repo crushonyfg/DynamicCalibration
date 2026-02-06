@@ -11,7 +11,7 @@ from .configs import CalibrationConfig
 from .emulator import DeterministicSimulator
 from .online_calibrator import OnlineBayesCalibrator
 from .koh_calibrator import KOHCalibrator
-from .enhanced_data import create_config2_config, EnhancedSyntheticDataStream, EnhancedChangepointConfig
+from .enhanced_data import create_config2_config, EnhancedSyntheticDataStream, EnhancedChangepointConfig, EnhancedSyntheticDataStream1
 from .projected_calibrator import BOCPDProjectedCalibrator
 from .koh_batch_calibrator import KOHBatchCalibrator
 from .bpc import BayesianProjectedCalibration
@@ -170,7 +170,7 @@ def plot_history(history, prefix: str = "cfg2"):
 # -------------------------------------------------------------
 # Main Experiment Function
 # -------------------------------------------------------------
-def run_config2_experiment(prefix: str = "cfg2"):
+def run_config2_experiment(prefix: str = "cfg2", data_mode="v1", diag_mode=False):
     """
     Config2 experiment comparing:
         - Standard BOCPD
@@ -178,31 +178,53 @@ def run_config2_experiment(prefix: str = "cfg2"):
         - KOH Calibration (explicit GP discrepancy)
     """
     # -------- Experiment setup --------
-    target_observations = 4000
-    batch_size = 40
+
+    target_observations = 1000
+    batch_size = 20
     # batch_size = 40
     assert target_observations % batch_size == 0
     seed_fixed = 123
 
-    calib_cfg = CalibrationConfig()
-    device, dtype = calib_cfg.model.device, calib_cfg.model.dtype
+    if data_mode == "v1":
+        calib_cfg = CalibrationConfig()
+        device, dtype = calib_cfg.model.device, calib_cfg.model.dtype
 
-    # Emulator
-    emulator = DeterministicSimulator(func=computer_model_config2, enable_autograd=True)
+        # Emulator
+        emulator = DeterministicSimulator(func=computer_model_config2, enable_autograd=True)
 
-    cfg2 = create_config2_config(
-        n_observations=target_observations,
-        noise_variance=0.04,               # 0.2^2
-        batch_size_range=(batch_size, batch_size),
-    )
-    cp_times = [800, 1600, 2400, 3200]
-    cfg2.changepoints = [
-        EnhancedChangepointConfig(time=cp_times[0], phys_param_new=torch.tensor([5, 5, 5], dtype=dtype, device=device)),
-        EnhancedChangepointConfig(time=cp_times[1], phys_param_new=torch.tensor([5, 12, 5], dtype=dtype, device=device)),
-        EnhancedChangepointConfig(time=cp_times[2], phys_param_new=torch.tensor([5, 7.0, 5], dtype=dtype, device=device)),
-        EnhancedChangepointConfig(time=cp_times[3], phys_param_new=torch.tensor([5, 11, 5], dtype=dtype, device=device)),
-    ]
-    seed_fixed = 123
+        cfg2 = create_config2_config(
+            n_observations=target_observations,
+            noise_variance=0.04,               # 0.2^2
+            batch_size_range=(batch_size, batch_size),
+        )
+        cp_times = [200, 400, 600, 800]
+        cfg2.changepoints = [
+            EnhancedChangepointConfig(time=cp_times[0], phys_param_new=torch.tensor([5, 5, 5], dtype=dtype, device=device)),
+            EnhancedChangepointConfig(time=cp_times[1], phys_param_new=torch.tensor([5, 12, 5], dtype=dtype, device=device)),
+            EnhancedChangepointConfig(time=cp_times[2], phys_param_new=torch.tensor([5, 7.0, 5], dtype=dtype, device=device)),
+            EnhancedChangepointConfig(time=cp_times[3], phys_param_new=torch.tensor([5, 11, 5], dtype=dtype, device=device)),
+        ]
+        seed_fixed = 123
+    elif data_mode == "v3":
+        seed_fixed = 123
+
+        calib_cfg = CalibrationConfig()
+        device, dtype = calib_cfg.model.device, calib_cfg.model.dtype
+
+        # Emulator
+        emulator = DeterministicSimulator(func=computer_model_config2, enable_autograd=True)
+
+        cfg2 = create_config2_config(
+            n_observations=target_observations,
+            noise_variance=0.04,               # 0.2^2
+            batch_size_range=(batch_size, batch_size),
+        )
+        cp_times = [200, 400, 600, 800]
+        cfg2.changepoints = [
+            EnhancedChangepointConfig(time=400, phys_param_new=torch.tensor([5, 5.0, 5])),
+            EnhancedChangepointConfig(time=500, phys_param_new=None),
+        ]
+
 
     # --------- 先验 θ ∈ [0,3] ----------
     theta_dim = 1
@@ -214,47 +236,41 @@ def run_config2_experiment(prefix: str = "cfg2"):
 
     # -------- Methods definition --------
     methods = {
-        # "KOH": {
-        #     "type": "koh",
-        #     "params": dict(
-        #         update_mode="full",
-        #         window_length=800,
-        #         lengthscale=0.3,
-        #         variance=1.0,
-        #         noise_var=0.04,
-        #         optimize_theta=True,
-        #         optimize_hypers=True,
-        #         max_opt_steps=200,
-        #     ),
-        # },
-        # "Standard": {
-        #     "type": "bocpd",
-        #     "bocpd_mode": "standard",
-        # },
-        "Restart-nothetatest": {
+        "Restart-nodiscrepancy": {
             "type": "bocpd",
             "bocpd_mode": "restart",
             "restart_theta_test": None,
+            "use_discrepancy": False,
         },
-        "Restart-energy0.5": {
+        "Restart-usediscrepancy": {
             "type": "bocpd",
             "bocpd_mode": "restart",
-            "restart_theta_test": "energy",
+            "restart_theta_test": None,
+            "use_discrepancy": True,
         },
-        "Restart-credible2": {
-            "type": "bocpd",
-            "bocpd_mode": "restart",
-            "restart_theta_test": "credible",
-        },
-        "Restart-sw0.5": {
-            "type": "bocpd",
-            "bocpd_mode": "restart",
-            "restart_theta_test": "sw",
-        },
+        # "Standard": {
+        #     "type": "bocpd",
+        #     "bocpd_mode": "standard",
+        # }, 
+        # "Restart-energy0.5": {
+        #     "type": "bocpd",
+        #     "bocpd_mode": "restart",
+        #     "restart_theta_test": "energy",
+        # },
+        # "Restart-credible2": {
+        #     "type": "bocpd",
+        #     "bocpd_mode": "restart",
+        #     "restart_theta_test": "credible",
+        # },
+        # "Restart-sw0.5": {
+        #     "type": "bocpd",
+        #     "bocpd_mode": "restart",
+        #     "restart_theta_test": "sw",
+        # },
         # "BPC":{
         #     "type": "bpc",
         #     "params": dict(
-        #         window_length=80,
+        #         window_length=40,
         #         noise_var=0.04,
         #         n_eta_draws=120,
         #         n_restart=6,
@@ -265,31 +281,13 @@ def run_config2_experiment(prefix: str = "cfg2"):
         # "BPC-BOCPD": {
         #     "type": "bpc_bocpd",
         #     "params": dict(
-        #         hazard_h=1.0 / 800.0,
+        #         hazard_h=1.0 / 200.0,
         #         topk=3,
         #         n_eta_draws_fit=300,
         #         n_restart_fit=8,
         #         n_eta_draws_prior=200,
         #         n_restart_prior=6,
         #         gp_fit_iters=150,
-        #     ),
-        # },
-        # "Proj+BOCPD+δGP": {
-        #     "type": "proj_bocpd",
-        #     "params": dict(
-        #         topk=5,
-        #         hazard_lambda=800.0,
-        #         yhat_update_mode="window",
-        #         yhat_window_length=800,
-        #         yhat_fit_iters=200,
-        #         theta_solver_kwargs=dict(
-        #             n_theta_samples=64,
-        #             n_restart=5,
-        #             proj_on="history",      # 或 "grid"; grid 需指定 x_range/n_grid
-        #             delta_update_mode="full",   # 或 "window"
-        #             delta_window_length=800,
-        #             delta_fit_iters=200,
-        #         )
         #     ),
         # },
     }
@@ -302,7 +300,10 @@ def run_config2_experiment(prefix: str = "cfg2"):
     for method_name, meta in methods.items():
         start_time = time()
         print(f"\n=== Running {method_name} ===")
-        stream = EnhancedSyntheticDataStream(cfg2, seed=seed_fixed)
+        if data_mode == "v1":
+            stream = EnhancedSyntheticDataStream(cfg2, seed=seed_fixed)
+        elif data_mode == "v3":
+            stream = EnhancedSyntheticDataStream1(cfg2, seed=seed_fixed)
 
         prediction_errors = []
         rmse_history = []
@@ -310,6 +311,10 @@ def run_config2_experiment(prefix: str = "cfg2"):
         batch_times_all = []
         total_observations = 0
         theta_history = []
+        others_history = []
+
+        if diag_mode:
+            diag_infos = {}
 
         # ----------- BOCPD methods -----------
         if meta["type"] == "bocpd":
@@ -326,6 +331,10 @@ def run_config2_experiment(prefix: str = "cfg2"):
                     calib_cfg.bocpd.restart_theta_test = meta["restart_theta_test"]
                 else:
                     calib_cfg.bocpd.restart_criteria = 'rank_change'
+                if meta["use_discrepancy"]:
+                    calib_cfg.model.use_discrepancy = True
+                else:
+                    calib_cfg.model.use_discrepancy = False
                 history = []
             else:
                 calib_cfg.bocpd.use_restart = True
@@ -334,14 +343,25 @@ def run_config2_experiment(prefix: str = "cfg2"):
             calibrator = OnlineBayesCalibrator(calib_cfg, emulator, prior_sampler)
 
             while total_observations < target_observations:
+                if diag_mode:
+                    diag_infos[total_observations] = {}
                 if total_observations % 100 == 0:
                     print(f"{method_name} Total observations: {total_observations}")
-                X_batch, Y_batch = stream.next()
+                if data_mode == "v1":
+                    X_batch, Y_batch = stream.next()
+                elif data_mode == "v3":
+                    X_batch, Y_batch = stream.next(batch_size)
                 batch_times_all.append(total_observations)
+                if diag_mode:
+                    diag_infos[total_observations]["data"] = {"X": X_batch.detach().cpu().numpy(), "Y": Y_batch.detach().cpu().numpy()}
 
                 if total_observations > 0:
                     pred = calibrator.predict_batch(X_batch)
-                    mu, var = pred["mu"], pred["var"]
+                    # mu, var = pred["mu"], pred["var"]
+                    mu, var = pred["mu_sim"], pred["var"]
+
+                    if diag_mode:
+                        diag_infos[total_observations]["pred"] = {"mu": mu.detach().cpu().numpy(), "var": var.detach().cpu().numpy(), "experts_res": pred["experts_res"]}
 
                     # --- batch RMSE / CRPS ---
                     rmse_batch = float(torch.sqrt(torch.mean((Y_batch - mu) ** 2)))
@@ -349,16 +369,36 @@ def run_config2_experiment(prefix: str = "cfg2"):
                     crps_batch = float(torch.mean(calculate_crps(Y_batch, mu, var)))
                     crps_history.append(crps_batch)
 
+                    if diag_mode:
+                        diag_infos[total_observations]["rmse"] = rmse_batch
+                        diag_infos[total_observations]["crps"] = crps_batch
+
                 rec = calibrator.step_batch(X_batch, Y_batch, verbose=True)
                 if meta["bocpd_mode"] == "restart":
-                    record = {"time": calibrator.bocpd.t, "experts": [{"run_length": e["run_length"], "mass": e["mass"], "theta_mean": e["theta_mean"]} for e in rec["experts_debug"]]}
+                    record = {"time": calibrator.bocpd.t, "experts": [{"run_length": e["run_length"], "mass": e["mass"], "theta_mean": e["theta_mean"]} for e in rec["experts_debug"]], "did_restart": rec["did_restart"]}
                     history.append(record)
+                if diag_mode:
+                    diag_infos[total_observations]["theta"] = [(e.pf.particles.theta, e.pf.particles.logw) for e in calibrator.bocpd.experts]
 
 
-                mean_theta, _ = calibrator._aggregate_particles()
+                mean_theta, var_theta, lo_theta, hi_theta = calibrator._aggregate_particles(0.9)
                 theta_history.append(float(mean_theta.cpu().numpy()))
 
                 total_observations += X_batch.shape[0]
+
+                ess_gini_info = []
+                for ei, e in enumerate(calibrator.bocpd.experts):
+                    ps = e.pf.particles
+                    ess_val = float(ps.ess().detach().cpu())
+                    gini_val = float(ps.gini().detach().cpu())
+                    ess_gini_info.append({"expert_id": ei, "ess": ess_val, "gini": gini_val})
+
+                for s in ess_gini_info:
+                    if s["ess"] < 0.05 * 1024:
+                        print(f"⚠️  PF degeneracy warning: Expert {s['expert_id']} ESS={s['ess']:.1f}")
+
+
+                others_history.append({"did_restart": rec["did_restart"], "theta_mean": mean_theta.cpu().numpy(), "theta_cov": var_theta.cpu().numpy(), "theta_ci90": (lo_theta.cpu().numpy(), hi_theta.cpu().numpy()), "ess_gini_info": ess_gini_info})
 
             results[method_name] = dict(
                 rmse_history=rmse_history,
@@ -366,7 +406,11 @@ def run_config2_experiment(prefix: str = "cfg2"):
                 times_rmse=batch_times_all[1:1 + len(rmse_history)],
                 changepoint_times=cp_times,
                 theta_history=theta_history,
+                others_history=others_history,
             )
+
+            if diag_mode:
+                torch.save(diag_infos, f"{prefix}_{method_name}_diag_infos.pt")
 
         # ----------- KOH method -----------
         elif meta["type"] == "koh":
@@ -529,7 +573,10 @@ def run_config2_experiment(prefix: str = "cfg2"):
                         print(f"{method_name} Total observations: {total_observations}, last theta: {theta_history[-1]:.4f}")
                     else:
                         print(f"{method_name} Total observations: {total_observations}")
-                X_batch, Y_batch = stream.next()
+                if data_mode == "v1":
+                    X_batch, Y_batch = stream.next()
+                elif data_mode == "v3":
+                    X_batch, Y_batch = stream.next(batch_size)
                 batch_times_all.append(total_observations)
 
                 if total_observations > 0 and bpc is not None:
@@ -577,6 +624,7 @@ def run_config2_experiment(prefix: str = "cfg2"):
             print(f"\n=== Running {method_name} ===")
 
             # -------- BPC-BOCPD 初始化 --------
+            # xmin, xmax = X_batch.min(), X_batch.max()
             bpc_bocpd = StandardBOCPD_BPC(
                 theta_lo=np.array([0.0]),
                 theta_hi=np.array([3.0]),
@@ -611,7 +659,10 @@ def run_config2_experiment(prefix: str = "cfg2"):
                     else:
                         print(f"{method_name} Total observations: {total_observations}")
 
-                X_batch, Y_batch = stream.next()
+                if data_mode == "v1":
+                    X_batch, Y_batch = stream.next()
+                elif data_mode == "v3":
+                    X_batch, Y_batch = stream.next(batch_size)
                 batch_times_all.append(total_observations)
 
                 # ---------- prediction ----------
@@ -645,6 +696,8 @@ def run_config2_experiment(prefix: str = "cfg2"):
 
 
                 total_observations += X_batch.shape[0]
+                mean_theta, var_theta, lo_theta, hi_theta = bpc_bocpd._aggregate_particles(0.9)
+                others_history.append({"did_restart": info["did_restart"], "theta_mean": mean_theta, "theta_cov": var_theta, "theta_ci90": (lo_theta, hi_theta)})
 
             results[method_name] = dict(
                 rmse_history=rmse_history,
@@ -652,6 +705,7 @@ def run_config2_experiment(prefix: str = "cfg2"):
                 times_rmse=batch_times_all[1:1 + len(rmse_history)],
                 changepoint_times=cp_times,
                 theta_history=theta_history,
+                others_history=others_history,
             )
 
 
@@ -660,6 +714,7 @@ def run_config2_experiment(prefix: str = "cfg2"):
         print(f"{method_name} Time taken: {end_time - start_time:.2f} seconds")
         if meta["type"] == "bocpd" and meta["bocpd_mode"] == "restart":
             plot_history(history, prefix=f"{prefix}_{method_name}")
+        results[method_name]["time consumed"] = end_time - start_time
 
 
     # -----------------------------------------------------
@@ -702,4 +757,4 @@ def run_config2_experiment(prefix: str = "cfg2"):
 # Entry point
 # -------------------------------------------------------------
 if __name__ == "__main__":
-    run_config2_experiment(prefix="cfg2_26011501_40_thetatest0.5_lhs_testmethodcompare")
+    run_config2_experiment(prefix="cfg2_260129_tryNoDiscrepancy", data_mode="v1",diag_mode=False)

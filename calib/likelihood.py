@@ -127,7 +127,8 @@ def loglik_and_grads(
     sigma_eps: float,
     need_grads: bool = False,
     need_hessian: bool = False,
-    hessian_mode: Literal["fisher", "gauss_newton"] = "fisher"
+    hessian_mode: Literal["fisher", "gauss_newton"] = "fisher",
+    use_discrepancy: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """
     Compute per-particle log-likelihood and optionally gradients/Hessian w.r.t theta.
@@ -142,7 +143,16 @@ def loglik_and_grads(
 
     # Emulator and discrepancy predictions
     mu_eta, var_eta = emulator.predict(x, particles.theta)  # [b,N]
-    mu_delta, var_delta = delta_state.predict(x)            # [b],[b]
+    # mu_delta, var_delta = delta_state.predict(x)            # [b],[b]
+    if use_discrepancy:
+        if delta_state is not None:
+            mu_delta, var_delta = delta_state.predict(x)            # [b],[b]
+        else:
+            mu_delta = torch.zeros_like(y)
+            var_delta = torch.ones_like(y)
+    else:
+        mu_delta = 0.0
+        var_delta = 0.0
     mu_tot, var_tot = predictive_stats(rho, mu_eta, var_eta, mu_delta, var_delta, sigma_eps)
 
     # Log-likelihood (per batch, per particle) -> assume online with b=1 commonly

@@ -20,8 +20,11 @@ class ParticleFilter:
 
     @classmethod
     def from_prior(cls, prior_sampler: Callable[[int], torch.Tensor], pf_config: PFConfig,
-                   device: str = "cpu", dtype: torch.dtype = torch.float64) -> "ParticleFilter":
-        theta = prior_sampler(pf_config.num_particles).to(device=device, dtype=dtype)
+                   device: str = "cpu", dtype: torch.dtype = torch.float64, theta_anchor=None) -> "ParticleFilter":
+        try:
+            theta = prior_sampler(pf_config.num_particles, theta_anchor=theta_anchor).to(device=device, dtype=dtype)
+        except:
+            theta = prior_sampler(pf_config.num_particles).to(device=device, dtype=dtype)
         logw = torch.full((pf_config.num_particles,), -math.log(pf_config.num_particles), dtype=dtype, device=device)
         return cls(ParticleSet(theta=theta, logw=logw), pf_config, device, dtype)
 
@@ -56,9 +59,10 @@ class ParticleFilter:
              delta_state: OnlineGPState,
              rho: float,
              sigma_eps: float,
-             grad_info: bool = False) -> Dict[str, Any]:
+             grad_info: bool = False,
+             use_discrepancy: bool = True) -> Dict[str, Any]:
         # Compute per-particle log-likelihood
-        info = loglik_and_grads(y_t, x_t, self.particles, emulator, delta_state, rho, sigma_eps, need_grads=grad_info)
+        info = loglik_and_grads(y_t, x_t, self.particles, emulator, delta_state, rho, sigma_eps, need_grads=grad_info, use_discrepancy=use_discrepancy)
         loglik_n = info["loglik"]  # [N]
         # Evidence under current particles (mixture)
         logw = self.particles.logw
@@ -90,10 +94,11 @@ class ParticleFilter:
                 delta_state: OnlineGPState,
                 rho: float,
                 sigma_eps: float,
-                grad_info: bool = False) -> Dict[str, Any]:
+                grad_info: bool = False,
+                use_discrepancy: bool = True) -> Dict[str, Any]:
         """批量粒子滤波更新"""
         # 批量计算per-particle log-likelihood
-        info = loglik_and_grads(Y_batch, X_batch, self.particles, emulator, delta_state, rho, sigma_eps, need_grads=grad_info)
+        info = loglik_and_grads(Y_batch, X_batch, self.particles, emulator, delta_state, rho, sigma_eps, need_grads=grad_info, use_discrepancy=use_discrepancy)
         loglik_n = info["loglik"]  # [N] - 已经是sum over batch
         
         # Evidence under current particles (mixture)

@@ -19,12 +19,17 @@ def my_restart_hook(t_now, r_new, s_star, anchor_rl, p_anchor, best_other):
     logging.info(f"[HOOK] Restart at t={t_now}: r←{r_new}, s*={s_star}, "
                  f"anchor_rl={anchor_rl}, p_anchor={p_anchor:.4f}, best={best_other:.4f}")
 
-from .bocpd import BOCPD as StandardBOCPD
+# from .bocpd import BOCPD as StandardBOCPD
+from .bocpd_gpytorch import BOCPD as StandardBOCPD
 # from .restart_bocpd import BOCPD as RestartBOCPD
-from .restart_bocpd_debug_260108 import BOCPD as RestartBOCPD
+
 # from .restart_bocpd_mbr import BOCPD as RestartBOCPD
 # from .restart_bocpd_mod import BOCPD as RestartBOCPD
 
+# from .restart_bocpd_debug_260108 import BOCPD as RestartBOCPD
+# from .restart_bocpd_debug_260114 import BOCPD as RestartBOCPD
+from .restart_bocpd_debug_260115_gpytorch import BOCPD as RestartBOCPD
+# from .restart_bocpd_260123_noisevec import BOCPD as RestartBOCPD
 
 class OnlineBayesCalibrator:
     def __init__(
@@ -115,7 +120,11 @@ class OnlineBayesCalibrator:
         mix_mu = torch.zeros(batch_size, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
         mix_var = torch.zeros(batch_size, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
         Z = 0.0
-        
+        experts_res = []
+
+        mix_mu_sim = torch.zeros(batch_size, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
+        mix_var_sim = torch.zeros(batch_size, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
+
         for e in self.bocpd.experts:
             w_e = math.exp(e.log_mass)
             mu_eta, var_eta = self.emulator.predict(X_batch, e.pf.particles.theta)  # [batch_size, N]
@@ -136,18 +145,26 @@ class OnlineBayesCalibrator:
             mix_mu += w_e * mu_mix
             mix_var += w_e * var_mix
             Z += w_e
+            experts_res.append({"mu_delta": mu_delta, "var_delta": var_delta, "w": w_e, "mu": mu_mix, "var": var_mix})
+
+            mu_sim = self.cfg.model.rho*mu_eta 
+            mu_sim_mix = (w * mu_sim).sum(dim=1)
+            mix_mu_sim += w_e * mu_sim_mix
         
         mix_mu = mix_mu / max(Z, 1e-12)
         mix_var = mix_var / max(Z, 1e-12)
-        return {"mu": mix_mu, "var": mix_var}
+        mix_mu_sim = mix_mu_sim / max(Z, 1e-12)
+        return {"mu": mix_mu, "var": mix_var, "experts_res": experts_res, "mu_sim": mix_mu_sim}
 
-    def _aggregate_particles(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _aggregate_particles(self, quantile = None) -> Tuple[torch.Tensor, torch.Tensor]:
         # mixture across experts by their masses
         if len(self.bocpd.experts) == 0:
             return None, None
         d = self.bocpd.experts[0].pf.particles.theta.shape[1]
         mean = torch.zeros(d, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
         cov = torch.zeros(d, d, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
+
+        theta_list, weight_list = [], []
         for e in self.bocpd.experts:
             w_e = math.exp(e.log_mass)
             w = e.pf.particles.weights()
@@ -156,7 +173,38 @@ class OnlineBayesCalibrator:
             C = ((th - m) * w[:, None]).T @ (th - m)
             mean = mean + w_e * m
             cov = cov + w_e * (C + (m - mean)[:, None] @ (m - mean)[None, :])
-        return mean, cov
+            theta_list.append(th)
+            weight_list.append(w_e*w)
+
+        theta_all = torch.cat(theta_list, dim=0)
+        weight_all = torch.cat(weight_list, dim=0)
+        weight_all = weight_all / weight_all.sum()
+
+        def weighted_quantile_1d(x,w,q):
+            idx = torch.argsort(x)
+            x = x[idx]
+            w = w[idx]
+            cw = torch.cumsum(w, dim=0)
+            return x[cw >= q][0]
+
+        def particle_ci(theta_all, weight_all, level=0.9):
+            alpha = (1.0 - level) / 2.0
+            lo_q = alpha
+            hi_q = 1.0 - alpha
+
+            d = theta_all.shape[1]
+            lo = torch.zeros(d, dtype=theta_all.dtype, device=theta_all.device)
+            hi = torch.zeros(d, dtype=theta_all.dtype, device=theta_all.device)
+            for j in range(d):
+                lo[j] = weighted_quantile_1d(theta_all[:, j], weight_all, lo_q)
+                hi[j] = weighted_quantile_1d(theta_all[:, j], weight_all, hi_q)
+            return lo, hi
+        
+        if quantile is None:
+            return mean, cov
+        else:
+            lo, hi = particle_ci(theta_all, weight_all, quantile)
+            return mean, cov, lo, hi
 
     def predict(self, x_next: torch.Tensor) -> Dict[str, torch.Tensor]:
         # mixture over experts and their particles

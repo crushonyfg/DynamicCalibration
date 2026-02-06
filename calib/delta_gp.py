@@ -257,6 +257,81 @@ class OnlineGPState:
         self._recompute_cache_full()
 
 
+import gpytorch
+
+class DeltaExactGP(gpytorch.models.ExactGP):
+    def __init__(self, X: torch.Tensor, y: torch.Tensor, likelihood: gpytorch.likelihoods.Likelihood, kernel: gpytorch.kernels.Kernel): # [t,dx],[t],Likelihood,Kernel
+        super().__init__(X, y, likelihood)
+        self.mean_module = gpytorch.means.ZeroMean()
+        self.covar_module = kernel
+
+    def forward(self, x: torch.Tensor):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+import math
+from dataclasses import dataclass
+@dataclass
+class GPyTorchDeltaState:
+    """
+    Exact GP state for discrepancy δ(x) using gpytorch.
+    No online updates, no rank-1 updates.
+    """
+    X: torch.Tensor  # [t,dx]
+    y: torch.Tensor  # [t]
+    kernel: gpytorch.kernels.Kernel
+    noise: Union[float, torch.Tensor]
+    model: DeltaExactGP=None
+    likelihood: gpytorch.likelihoods.Likelihood=None
+
+    def __post_init__(self):
+        self._build_model()
+
+    def _build_model(self):
+        if isinstance(self.noise, torch.Tensor):
+            self.likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(noise=self.noise.to(self.X.device, self.X.dtype), learn_additional_noise=True)
+        else:
+            self.likelihood = gpytorch.likelihoods.GaussianLikelihood()
+            # self.likelihood.noise = torch.tensor(max(float(self.noise), 1e-8), dtype=self.X.dtype, device=self.X.device)
+
+        self.model = DeltaExactGP(self.X, self.y, likelihood=self.likelihood, kernel=self.kernel).to(self.X.device, self.X.dtype)
+
+    @torch.no_grad()
+    def predict(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = x.to(self.X.device, self.X.dtype)
+        self.model.eval()
+        self.likelihood.eval()
+        with gpytorch.settings.fast_pred_var():
+            pred = self.likelihood(self.model(x))
+            mu = pred.mean
+            var = pred.variance.clamp_min(1e-12)
+        return mu, var
+
+    @torch.no_grad()
+    def log_predictive(self, y: torch.Tensor, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self.model.eval()
+        self.likelihood.eval()
+        with gpytorch.settings.fast_pred_var():
+            pred = self.likelihood(self.model(x))
+            mu = pred.mean
+            var = pred.variance.clamp_min(1e-12)
+            logpdf = pred.log_prob(y)
+        return mu, var, logpdf
+
+def fit_gpytorch_delta(state: GPyTorchDeltaState, max_iter: int = 100, lr: float = 0.1):
+    state.model.train()
+    state.likelihood.train()
+    opt = torch.optim.Adam(state.model.parameters(), lr=lr)
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(state.likelihood, state.model)
+    for _ in range(max_iter):
+        opt.zero_grad()
+        out = state.model(state.X)
+        loss = -mll(out, state.y)
+        loss.backward()
+        opt.step()
+    return state
+
 
 # ------------------------- SVGP (gpytorch) adapter -------------------------
 class SVGPState:
