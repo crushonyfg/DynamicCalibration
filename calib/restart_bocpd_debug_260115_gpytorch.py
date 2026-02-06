@@ -449,6 +449,7 @@ class BOCPD:
                 use_discrepancy=model_cfg.use_discrepancy,
             )
             pf_diags.append(diag)
+            # print(e.run_length, diag["ess"], diag["gini"])
 
             X_hist = e.X_hist
             Y_hist = e.y_hist

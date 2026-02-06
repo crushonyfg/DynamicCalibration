@@ -16,7 +16,7 @@ import itertools
 # -------------------------------------------------------------
 from .configs import CalibrationConfig
 from .emulator import DeterministicSimulator
-from .online_calibrator import OnlineBayesCalibrator
+from .online_calibrator import OnlineBayesCalibrator, crps_gaussian
 from .bpc import BayesianProjectedCalibration
 from .bcp_bocpd import *  # StandardBOCPD_BPC
 
@@ -238,6 +238,9 @@ def run_one_sudden(
             cfg.bocpd.bocpd_mode = meta["mode"]
             cfg.bocpd.use_restart = True
 
+            if meta["mode"] == "restart":
+                cfg.model.use_discrepancy = meta["use_discrepancy"]
+
             emulator = DeterministicSimulator(
                 func=computer_model_config2_torch,
                 enable_autograd=True,
@@ -249,11 +252,19 @@ def run_one_sudden(
                     print(f"     {name}: total_obs={total_obs}")
 
                 Xb, Yb = stream.next()
+                report_sub_hist = None
 
                 if total_obs > 0:
                     pred = calib.predict_batch(Xb)
-                    # rmse_hist.append(float(torch.sqrt(((pred["mu"] - Yb) ** 2).mean())))
-                    rmse_hist.append(float(torch.sqrt(((pred["mu_sim"] - Yb) ** 2).mean())))
+                    pred_comp = calib.predict_complete(Xb, Yb)
+                    report_sub_hist = (pred_comp["crps_sim"].item(),pred_comp["experts_logpred"],pred_comp["var_sim"])
+                    # print(name, total_obs, report_hist[-1])
+                    # rmse_hist.append(
+                    #     float(torch.sqrt(((pred["mu"] - Yb) ** 2).mean()))
+                    # )
+                    rmse_hist.append(
+                        float(torch.sqrt(((pred["mu_sim"] - Yb) ** 2).mean()))
+                    )
 
                 rec = calib.step_batch(Xb, Yb, verbose=False)
 
@@ -268,9 +279,10 @@ def run_one_sudden(
                 ess_gini_info = []
                 for ei, e in enumerate(calib.bocpd.experts):
                     ps = e.pf.particles
-                    ess_val = float(ps.ess().detach().cpu())
-                    gini_val = float(ps.gini().detach().cpu())
-                    ess_gini_info.append({"expert_id": ei, "ess": ess_val, "gini": gini_val})
+                    unique_ratio = float(ps.unique_ratio())
+                    entropy_1d_histogram = float(ps.entropy_1d_histogram())
+                    # print(ei, unique_ratio, entropy_1d_histogram)
+                    ess_gini_info.append({"expert_id": ei, "unique_ratio": unique_ratio, "entropy_1d_histogram": entropy_1d_histogram})
 
                 others_hist.append(
                     dict(
@@ -281,6 +293,9 @@ def run_one_sudden(
                         ess_gini_info=ess_gini_info,
                         seg_id=int(stream.seg_history[-1]),
                         t=int(total_obs),
+                        pf_info=rec["pf_diags"],
+                        report_sub_hist=report_sub_hist,
+                        pf_health_info=ess_gini_info,
                     )
                 )
 
@@ -298,6 +313,7 @@ def run_one_sudden(
                     print(f"     {name}: total_obs={total_obs}")
 
                 Xb, Yb = stream.next()
+                crps_sim = None
                 if X_hist is None:
                     X_hist, y_hist = Xb.numpy(), Yb.numpy()
                 else:
@@ -309,8 +325,9 @@ def run_one_sudden(
 
                 if total_obs > 0 and bpc is not None:
                     mu_np, var_np = bpc.predict_sim(Xb.detach().cpu().numpy())
-                    mu_t = torch.tensor(mu_np, dtype=Yb.dtype, device=Yb.device)
+                    mu_t, var_t = torch.tensor(mu_np, dtype=Yb.dtype, device=Yb.device), torch.tensor(var_np, dtype=Yb.dtype, device=Yb.device) 
                     rmse_hist.append(float(torch.sqrt(((mu_t - Yb) ** 2).mean())))
+                    crps_sim = crps_gaussian(mu_t, var_t, Yb)
 
                 X_all, y_all = X_hist, y_hist
 
@@ -324,6 +341,7 @@ def run_one_sudden(
                 bpc.fit(X_all, y_all, X_grid, n_eta_draws=500, n_restart=10, gp_fit_iters=200)
 
                 theta_hist.append(float(bpc.theta_mean[0]))
+                entropy_info = bpc.entropy_theta()
                 others_hist.append(
                     dict(
                         did_restart=False,
@@ -332,6 +350,8 @@ def run_one_sudden(
                         hi=float("nan"),
                         seg_id=int(stream.seg_history[-1]),
                         t=int(total_obs),
+                        entropy=entropy_info,
+                        crps_sim=crps_sim,
                     )
                 )
 
@@ -354,11 +374,13 @@ def run_one_sudden(
                     print(f"     {name}: total_obs={total_obs}")
 
                 Xb, Yb = stream.next()
+                crps_sim = None
 
                 if total_obs > 0:
-                    mu, var = calib.predict_sim(Xb.detach().cpu().numpy() if not isinstance(Xb, np.ndarray) else Xb)
-                    mu_t = torch.tensor(mu, dtype=Yb.dtype, device=Yb.device)
+                    mu, var = calib.predict_sim(Xb)
+                    mu_t, var_t = torch.tensor(mu, dtype=Yb.dtype, device=Yb.device), torch.tensor(var, dtype=Yb.dtype, device=Yb.device)
                     rmse_hist.append(float(torch.sqrt(((mu_t - Yb) ** 2).mean())))
+                    crps_sim = crps_gaussian(mu_t, var_t, Yb)
 
                 info = calib.step_batch(Xb.detach().cpu().numpy(), Yb.detach().cpu().numpy())
 
@@ -377,6 +399,7 @@ def run_one_sudden(
                         hi=float(theta_hi[0]) if np.ndim(theta_hi) >= 1 else float(theta_hi),
                         seg_id=int(stream.seg_history[-1]),
                         t=int(total_obs),
+                        crps_sim=crps_sim,
                     )
                 )
 
@@ -452,7 +475,7 @@ def plot_theta_tracking(
 # 3 changepoints per run, phi centered around 7.5
 # -------------------------------------------------------------
 def main():
-    out_dir = "./sudden_grid_outputs/v4"
+    out_dir = "./figs/sudden_grid_outputs/v1"
     os.makedirs(out_dir, exist_ok=True)
 
     # --- experimental grid ---
@@ -461,17 +484,19 @@ def main():
 
     # frequency: segment length L in observation-time units
     # NOTE: must be divisible by batch_size (enforced in run_one_sudden)
-    seg_lens = [40, 120, 200]  # frequency: smaller => more frequent CPs
+    seg_lens = [80, 120, 200]  # frequency: smaller => more frequent CPs
 
     # magnitude: delta applied to phi[1] around center=7.5
-    magnitudes = [0.5, 1.0, 2.0, 3.0]
+    magnitudes = [0.5, 1.0, 2.0, 3.0, 5.0]
 
     # methods
     methods = {
         "BOCPD-PF": dict(type="bocpd", mode="standard"),
-        "R-BOCPD-PF": dict(type="bocpd", mode="restart"),
         "BPC-80": dict(type="bpc"),
-        "BOCPD-BPC": dict(type="bpc_bocpd", params=dict()),
+        "BOCPD-BPC": dict(type="bpc_bocpd"),
+        "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
+        "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False),
+        # "BPC-80": dict(type="bpc"),
     }
 
     # run grid

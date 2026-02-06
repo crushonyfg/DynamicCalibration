@@ -142,6 +142,19 @@ def fit_delta_gp(X: np.ndarray, r: np.ndarray, iters: int = 200, device="cpu"):
     return model, likelihood
 
 
+def gini_theta(samples):
+    x = np.sort(np.asarray(samples).reshape(-1))
+    n = len(x)
+    idx = np.arange(1, n+1)
+    return 1 - 2 * np.sum((n - idx + 0.5) * x) / (n * np.sum(x))
+
+def entropy_theta(samples, bins=30):
+    hist, _ = np.histogram(samples, bins=bins, density=True)
+    p = hist / np.sum(hist)
+    p = p[p > 0]
+    return -np.sum(p * np.log(p))
+
+
 # =========================
 # 4) Bayesian Projected Calibration (paper-style)
 # =========================
@@ -260,6 +273,9 @@ class BayesianProjectedCalibration:
         var_theta = Ys.var(axis=0)
 
         return mu_theta, var_theta
+
+    def entropy_theta(self):
+        return entropy_theta(self.theta_samples[:,0])
 
     def prior_log_predictive(
         self,

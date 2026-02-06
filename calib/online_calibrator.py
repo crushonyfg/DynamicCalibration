@@ -31,6 +31,44 @@ from .bocpd_gpytorch import BOCPD as StandardBOCPD
 from .restart_bocpd_debug_260115_gpytorch import BOCPD as RestartBOCPD
 # from .restart_bocpd_260123_noisevec import BOCPD as RestartBOCPD
 
+import torch
+
+def crps_weighted(samples, weights, y):
+    """
+    samples: [N] or [N, D]
+    weights: [N], sum to 1
+    y: scalar or [D]
+    """
+    w = weights / weights.sum()
+
+    # term 1: E|X - y|
+    term1 = torch.sum(w * torch.norm(samples - y, dim=-1))
+
+    # term 2: E|X - X'|
+    diff = samples[:, None, ...] - samples[None, :, ...]
+    term2 = torch.sum(
+        w[:, None] * w[None, :] *
+        torch.norm(diff, dim=-1)
+    )
+
+    return term1 - 0.5 * term2
+
+import math
+import torch
+
+def normal_pdf(z):
+    return torch.exp(-0.5 * z**2) / math.sqrt(2.0 * math.pi)
+
+def normal_cdf(z):
+    return 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
+
+def crps_gaussian(mu, var, y, eps=1e-12):
+    sigma = torch.sqrt(torch.clamp(var, min=eps))
+    z = (y - mu) / sigma
+    Phi = normal_cdf(z)
+    phi = normal_pdf(z)
+    return sigma * (z * (2.0 * Phi - 1.0) + 2.0 * phi - 1.0 / math.sqrt(math.pi))
+
 class OnlineBayesCalibrator:
     def __init__(
         self,
@@ -155,6 +193,116 @@ class OnlineBayesCalibrator:
         mix_var = mix_var / max(Z, 1e-12)
         mix_mu_sim = mix_mu_sim / max(Z, 1e-12)
         return {"mu": mix_mu, "var": mix_var, "experts_res": experts_res, "mu_sim": mix_mu_sim}
+
+    def predict_complete(
+        self,
+        X_batch: torch.Tensor,
+        y_batch: torch.Tensor,
+    ):
+        X_batch = X_batch.to(self.cfg.model.device, self.cfg.model.dtype)
+        y_batch = y_batch.to(self.cfg.model.device, self.cfg.model.dtype)
+        batch_size = X_batch.shape[0]
+
+        mix_mu = torch.zeros(batch_size, dtype=X_batch.dtype, device=X_batch.device)
+        mix_var = torch.zeros(batch_size, dtype=X_batch.dtype, device=X_batch.device)
+        mix_mu_sim = torch.zeros(batch_size, dtype=X_batch.dtype, device=X_batch.device)
+
+        Z = 0.0
+        experts_logpred = []
+
+        for e in self.bocpd.experts:
+            w_e = math.exp(e.log_mass)   # expert mass (unnormalized)
+
+            # ---------- emulator ----------
+            mu_eta, var_eta = self.emulator.predict(
+                X_batch, e.pf.particles.theta
+            )  # [B, Np]
+
+            # ---------- delta ----------
+            try:
+                mu_delta, var_delta = e.delta_state.predict(X_batch)  # [B]
+            except:
+                mu_deltas, var_deltas = [], []
+                for delta_state in e.delta_states:
+                    mu_d, var_d = delta_state.predict(X_batch)
+                    mu_deltas.append(mu_d)
+                    var_deltas.append(var_d)
+                mu_delta = torch.stack(mu_deltas, dim=1).mean(dim=1)
+                var_delta = torch.stack(var_deltas, dim=1).mean(dim=1)
+
+            # ---------- full predictive (particle-level) ----------
+            mu, var = predictive_stats(
+                self.cfg.model.rho,
+                mu_eta, var_eta,
+                mu_delta, var_delta,
+                self.cfg.model.sigma_eps,
+            )  # mu,var: [B, Np]
+
+            # PF particle weights
+            w = e.pf.particles.weights()[None, :]  # [1, Np]
+
+            # ---------- expert-level Gaussian (moment matched) ----------
+            mu_e = (w * mu).sum(dim=1)  # [B]
+            var_e = (w * (var + mu**2)).sum(dim=1) - mu_e**2  # [B]
+
+            mix_mu += w_e * mu_e
+            mix_var += w_e * var_e
+
+            # ---------- simulator-only ----------
+            mu_sim = self.cfg.model.rho * mu_eta
+            mu_sim_e = (w * mu_sim).sum(dim=1)
+            mix_mu_sim += w_e * mu_sim_e
+
+            # ---------- expert log predictive (Gaussian approx) ----------
+            # log N(y | mu_e, var_e)
+            logp_e = -0.5 * (
+                torch.log(2.0 * math.pi * torch.clamp(var_e, min=1e-12))
+                + (y_batch - mu_e)**2 / torch.clamp(var_e, min=1e-12)
+            )
+            logp_e = logp_e.mean()  # batch average
+
+            experts_logpred.append({
+                "logp": logp_e.detach(),
+                "weight": w_e,
+                "log_mass": e.log_mass,
+            })
+
+            Z += w_e
+
+        # ---------- normalize mixture ----------
+        Z = max(Z, 1e-12)
+        mix_mu = mix_mu / Z
+        mix_var = mix_var / Z
+        mix_mu_sim = mix_mu_sim / Z
+
+        # ---------- simulator-only Gaussian CRPS ----------
+        # need simulator-only variance
+        # approximate: Var_sim = Var[rho * mu_eta] under particle+expert mixture
+        # (no delta, no obs noise)
+        # reuse second moment trick
+
+        Ey2_sim = torch.zeros_like(mix_mu_sim)
+        for e in self.bocpd.experts:
+            w_e = math.exp(e.log_mass)
+            mu_eta, _ = self.emulator.predict(X_batch, e.pf.particles.theta)
+            mu_sim = self.cfg.model.rho * mu_eta
+            w = e.pf.particles.weights()[None, :]
+            Ey2_sim += w_e * (w * mu_sim**2).sum(dim=1)
+
+        Ey2_sim = Ey2_sim / Z
+        var_sim = torch.clamp(Ey2_sim - mix_mu_sim**2, min=1e-12)
+
+        crps_sim = crps_gaussian(mix_mu_sim, var_sim, y_batch).mean()
+
+        return {
+            "mix_mu": mix_mu,
+            "mix_var": mix_var,
+            "mu_sim": mix_mu_sim,
+            "var_sim": var_sim,
+            "crps_sim": crps_sim,
+            "experts_logpred": experts_logpred,
+        }
+
 
     def _aggregate_particles(self, quantile = None) -> Tuple[torch.Tensor, torch.Tensor]:
         # mixture across experts by their masses

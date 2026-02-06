@@ -110,6 +110,7 @@ class ParticleFilter:
         self.particles.normalize_()
         
         ess = self.particles.ess().item()
+        gini = self.particles.gini().item()
         N = self.particles.theta.shape[0]
         resampled = False
         
@@ -124,6 +125,7 @@ class ParticleFilter:
         return {
             "log_evidence": float(logmix),
             "ess": ess,
+            "gini": gini,
             "resampled": resampled,
             "maybe_grad": info.get("grad", None),
         }

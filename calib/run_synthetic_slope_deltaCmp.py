@@ -14,7 +14,7 @@ from time import time
 # -------------------------------------------------------------
 from .configs import CalibrationConfig
 from .emulator import DeterministicSimulator
-from .online_calibrator import OnlineBayesCalibrator
+from .online_calibrator import OnlineBayesCalibrator, crps_gaussian
 from .bpc import BayesianProjectedCalibration
 from .bcp_bocpd import *
 
@@ -36,7 +36,36 @@ def computer_model_config2_torch(x: torch.Tensor, theta: torch.Tensor) -> torch.
         theta = theta[None, :]
     return torch.sin(5.0 * theta[:, 0:1] * x[:, 0:1]) + 5.0 * x[:, 0:1]
 
+from scipy.interpolate import interp1d
 
+def build_phi2_from_theta_star(
+    phi2_grid: np.ndarray,
+    theta_grid: np.ndarray,
+    a1: float = 5.0,
+    a3: float = 5.0,
+):
+    """
+    构造 φ2 = f(θ*) 的插值函数
+    """
+
+    theta_star_vals = []
+
+    for phi2 in phi2_grid:
+        phi = np.array([a1, phi2, a3])
+        theta_star = oracle_theta(phi, theta_grid)
+        theta_star_vals.append(theta_star)
+
+    theta_star_vals = np.asarray(theta_star_vals)
+
+    phi2_of_theta = interp1d(
+        theta_star_vals,
+        phi2_grid,
+        kind="linear",
+        fill_value="extrapolate",
+        bounds_error=False,
+    )
+
+    return phi2_of_theta, theta_star_vals
 # -------------------------------------------------------------
 # True physical system η(x; φ(t))
 # -------------------------------------------------------------
@@ -98,7 +127,67 @@ class SlopeDriftDataStream:
             torch.tensor(y, dtype=torch.float32),
         )
 
+class ThetaDrivenSlopeDataStream:
+    """
+    Ground truth: θ*(t) 线性变化
+    Physical parameter φ2(t) 由数值反推得到
+    """
 
+    def __init__(
+        self,
+        total_T: int,
+        batch_size: int,
+        noise_sd: float,
+        theta0: float,
+        theta_slope: float,
+        phi2_of_theta,           # 上一步构造的插值函数
+        phi_base = np.array([5.0, 0.0, 5.0]),
+        seed: int = 0,
+    ):
+        self.T = total_T
+        self.bs = batch_size
+        self.noise_sd = noise_sd
+        self.theta0 = theta0
+        self.theta_slope = theta_slope
+        self.phi_base = phi_base.copy()
+        self.phi2_of_theta = phi2_of_theta
+
+        self.rng = np.random.RandomState(seed)
+        self.t = 0
+
+        self.theta_star_history = []
+        self.phi_history = []
+
+    def true_theta_star(self, t: int) -> float:
+        return self.theta0 + self.theta_slope * t
+
+    def true_phi(self, t: int) -> np.ndarray:
+        theta_star = self.true_theta_star(t)
+        phi = self.phi_base.copy()
+        phi[1] = float(self.phi2_of_theta(theta_star))
+        return phi
+
+    def next(self):
+        if self.t >= self.T:
+            raise StopIteration
+
+        u = (np.arange(self.bs) + self.rng.rand(self.bs)) / self.bs
+        X = u[:, None]
+
+        phi_t = self.true_phi(self.t)
+        theta_star_t = self.true_theta_star(self.t)
+
+        y = physical_system(X, phi_t) + self.noise_sd * self.rng.randn(self.bs)
+
+        self.phi_history.append(phi_t.copy())
+        self.theta_star_history.append(theta_star_t)
+
+        self.t += self.bs
+
+        return (
+            torch.tensor(X, dtype=torch.float32),
+            torch.tensor(y, dtype=torch.float32),
+        )
 # -------------------------------------------------------------
 # Oracle θ*(φ) via dense grid search
 # -------------------------------------------------------------
@@ -126,13 +215,26 @@ def run_one_slope(
     total_T: int = 600,
     batch_size: int = 20,
     seed: int = 123,
+    phi2_of_theta: callable = None,
+    mode: int = 0,#0: slope origin, 1: slope inverse, 2: sudden origin
 ):
     print(f"\n=== Running slope={slope:.4f} ===")
 
-    stream = SlopeDriftDataStream(
+    if mode == 0:
+        stream = SlopeDriftDataStream(
+            total_T=total_T,
+            batch_size=batch_size,
+            slope=slope,
+            seed=seed,
+        )
+    elif mode == 1:
+        stream = ThetaDrivenSlopeDataStream(
         total_T=total_T,
         batch_size=batch_size,
-        slope=slope,
+        noise_sd=0.2,
+        theta0=1.6,                 # 起始 θ*
+        theta_slope=slope,          # 你想测试的 drift
+        phi2_of_theta=phi2_of_theta,
         seed=seed,
     )
 
@@ -175,6 +277,26 @@ def run_one_slope(
         theta_hist, rmse_hist = [], []
         total_obs = 0
         others_hist = []
+        report_sub_hist = []
+        theta_var_hist = []
+
+        if mode == 0:
+            stream2 = SlopeDriftDataStream(
+                total_T=total_T,
+                batch_size=batch_size,
+                slope=slope,
+                seed=seed,
+            )
+        elif mode == 1:
+            stream2 = ThetaDrivenSlopeDataStream(
+            total_T=total_T,
+            batch_size=batch_size,
+            noise_sd=0.2,
+            theta0=1.6,                 # 起始 θ*
+            theta_slope=slope,          # 你想测试的 drift
+            phi2_of_theta=phi2_of_theta,
+            seed=seed,
+        )
         
 
         # ---------- BOCPD ----------
@@ -196,12 +318,12 @@ def run_one_slope(
             else:
                 calib = OnlineBayesCalibrator(cfg, emulator, prior_sampler)
 
-            stream2 = SlopeDriftDataStream(
-                total_T=total_T,
-                batch_size=batch_size,
-                slope=slope,
-                seed=seed,
-            )
+            # stream2 = SlopeDriftDataStream(
+            #     total_T=total_T,
+            #     batch_size=batch_size,
+            #     slope=slope,
+            #     seed=seed,
+            # )
 
             while total_obs < total_T:
                 if total_obs % 100 == 0:
@@ -210,6 +332,9 @@ def run_one_slope(
 
                 if total_obs > 0:
                     pred = calib.predict_batch(Xb)
+                    pred_comp = calib.predict_complete(Xb, Yb)
+                    report_sub_hist = (pred_comp["crps_sim"].item(),pred_comp["experts_logpred"],pred_comp["var_sim"])
+                    # print(name, total_obs, report_hist[-1])
                     # rmse_hist.append(
                     #     float(torch.sqrt(((pred["mu"] - Yb) ** 2).mean()))
                     # )
@@ -224,10 +349,11 @@ def run_one_slope(
                 ess_gini_info = []
                 for ei, e in enumerate(calib.bocpd.experts):
                     ps = e.pf.particles
-                    ess_val = float(ps.ess().detach().cpu())
-                    gini_val = float(ps.gini().detach().cpu())
-                    ess_gini_info.append({"expert_id": ei, "ess": ess_val, "gini": gini_val})
-                others_hist.append({"did_restart": rec["did_restart"],"var": float(var_theta[0]), "lo": float(lo_theta[0]), "hi": float(hi_theta[0]), "ess_gini_info": ess_gini_info})
+                    unique_ratio = float(ps.unique_ratio())
+                    entropy_1d_histogram = float(ps.entropy_1d_histogram())
+                    # print(ei, unique_ratio, entropy_1d_histogram)
+                    ess_gini_info.append({"expert_id": ei, "unique_ratio": unique_ratio, "entropy_1d_histogram": entropy_1d_histogram})
+                others_hist.append({"did_restart": rec["did_restart"],"var": float(var_theta[0]), "lo": float(lo_theta[0]), "hi": float(hi_theta[0]), "pf_info": rec["pf_diags"], "report_sub_hist": report_sub_hist, "pf_health_info": ess_gini_info})
 
                 if use_sampler1:
                     calib.theta_anchor = mean_theta[0]
@@ -239,17 +365,18 @@ def run_one_slope(
             W = 80
             X_hist = None
             y_hist = None
-            stream2 = SlopeDriftDataStream(
-                total_T=total_T,
-                batch_size=batch_size,
-                slope=slope,
-                seed=seed,
-            )
+            # stream2 = SlopeDriftDataStream(
+            #     total_T=total_T,
+            #     batch_size=batch_size,
+            #     slope=slope,
+            #     seed=seed,
+            # )
 
             while total_obs < total_T:
                 if total_obs % 100 == 0:
                     print(f"{name}  -> total_obs: {total_obs}")
                 Xb, Yb = stream2.next()
+                crps_sim = None
                 if X_hist is None:
                     X_hist, y_hist = Xb.numpy(), Yb.numpy()
                 else:
@@ -264,6 +391,8 @@ def run_one_slope(
                     mu_np, var_np = bpc.predict_sim(Xb.detach().cpu().numpy())
                     mu_t, var_t = torch.tensor(mu_np, dtype=Yb.dtype, device=Yb.device), torch.tensor(var_np, dtype=Yb.dtype, device=Yb.device) 
                     rmse_hist.append(float(torch.sqrt(((mu_t - Yb) ** 2).mean())))
+                    crps_sim = crps_gaussian(mu_t, var_t, Yb)
+                    # print("bpc crps sim:", crps_sim)
 
                 X_all, y_all = X_hist, y_hist
 
@@ -278,7 +407,11 @@ def run_one_slope(
                 bpc.fit(X_all, y_all, X_grid, n_eta_draws=500, n_restart=10, gp_fit_iters=200)
 
                 theta_hist.append(float(bpc.theta_mean[0]))
+                # print("bpc theta var:", bpc.theta_var[0])
+                entropy_info = bpc.entropy_theta()
+                # print("bpc theta entropy:", entropy_info)
                 total_obs += batch_size
+                others_hist.append({"var": float(bpc.theta_var[0]), "entropy": entropy_info, "crps_sim": crps_sim})
 
         # ---------- BPC + BOCPD ----------
         elif meta["type"] == "bpc_bocpd":
@@ -290,21 +423,24 @@ def run_one_slope(
                 X_grid=np.linspace(0, 1, 300).reshape(-1, 1),
             )
 
-            stream2 = SlopeDriftDataStream(
-                total_T=total_T,
-                batch_size=batch_size,
-                slope=slope,
-                seed=seed,
-            )
+            # stream2 = SlopeDriftDataStream(
+            #     total_T=total_T,
+            #     batch_size=batch_size,
+            #     slope=slope,
+            #     seed=seed,
+            # )
 
             while total_obs < total_T:
                 if total_obs % 100 == 0:
                     print(f"{name}  -> total_obs: {total_obs}")
                 Xb, Yb = stream2.next()
+                crps_sim = None
                 if total_obs > 0:
                     mu, var = calib.predict_sim(Xb)
                     mu_t, var_t = torch.tensor(mu, dtype=Yb.dtype, device=Yb.device), torch.tensor(var, dtype=Yb.dtype, device=Yb.device)
                     rmse_hist.append(float(torch.sqrt(((mu_t - Yb) ** 2).mean())))
+                    crps_sim = crps_gaussian(mu_t, var_t, Yb)
+                    # print("bocpd-bpc crps sim:", crps_sim)
                 info = calib.step_batch(Xb.detach().cpu().numpy(), Yb.detach().cpu().numpy())
 
                 masses = np.asarray(info["masses"])
@@ -321,7 +457,8 @@ def run_one_slope(
 
                 theta_mean, theta_var, theta_lo, theta_hi = calib._aggregate_particles(0.9)
                 theta_hist.append(float(theta_mean[0]))
-                others_hist.append({"did_restart": info["did_restart"], "var": theta_var[0], "lo": theta_lo, "hi": theta_hi})
+                # print("bocpd-bpc theta var:", theta_var[0])
+                others_hist.append({"did_restart": info["did_restart"], "var": theta_var[0], "lo": theta_lo, "hi": theta_hi, "crps_sim": crps_sim})
                 # print(theta_mean, theta_var[0], theta_lo, theta_hi)
 
         # ---------- oracle ----------
@@ -331,11 +468,13 @@ def run_one_slope(
         ]
 
         results[name] = dict(
-            theta=np.array(theta_hist),
-            theta_oracle=np.array(oracle_hist),
-            others=others_hist,
-            rmse=np.array(rmse_hist),
-        )
+                theta=np.array(theta_hist),
+                theta_oracle=np.array(oracle_hist),
+                others=others_hist,
+                rmse=np.array(rmse_hist),
+            )
+        if mode == 1:
+            results[name]["theta_star_true"] = np.array(stream2.theta_star_history)
 
         print(f"     done in {time() - t0:.1f}s")
 
@@ -354,17 +493,30 @@ def main():
     seeds = [456]
     batch_sizes = [10, 20, 40]
     slopes = [0.001, 0.002, 0.003, 0.005, 0.008, 0.01]
-    # batch_sizes = [40]
-    # slopes = [0.005]
-    store_dir = "figs/slope_v6"
+    # batch_sizes = [20]
+    # slopes = [0.003]
+    store_dir = "figs/slope_deltaCmp_v1"
     import os
     os.makedirs(store_dir, exist_ok=True)
 
+    mode = 1
+    if mode == 1:
+        phi2_grid = np.linspace(3.0, 12.0, 300)
+        theta_grid = np.linspace(0.0, 3.0, 600)
+
+        phi2_of_theta, _ = build_phi2_from_theta_star(
+            phi2_grid=phi2_grid,
+            theta_grid=theta_grid,
+        )
+    else:
+        phi2_of_theta = None
+
     methods = {
-        # "BOCPD-BPC": dict(type="bpc_bocpd"),
-        # "BOCPD-PF": dict(type="bocpd", mode="standard"),
-        "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False),
+        "BPC-80": dict(type="bpc"),
+        "BOCPD-BPC": dict(type="bpc_bocpd"),
+        "BOCPD-PF": dict(type="bocpd", mode="standard"),
         "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
+        "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False),
         # "BPC-80": dict(type="bpc"),
     }
 
@@ -372,7 +524,7 @@ def main():
     import itertools
 
     for s,batch_size,seed in itertools.product(slopes, batch_sizes, seeds):
-        res, phi_hist, oracle_hist = run_one_slope(s, methods, batch_size=batch_size, seed=seed)
+        res, phi_hist, oracle_hist = run_one_slope(s, methods, batch_size=batch_size, seed=seed, phi2_of_theta=phi2_of_theta, mode=mode)
         all_results[s] = res
 
         # ---------- plot ----------
