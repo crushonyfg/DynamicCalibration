@@ -1,0 +1,7 @@
+experiment,method,seed,cp_time,delay,restarts
+E2,R-BOCPD-PF-nodiscrepancy,456,200,20,2
+E2,R-BOCPD-PF-nodiscrepancy,456,400,20,2
+E2,R-BOCPD-PF-nodiscrepancy,456,600,,2
+E2,R-BOCPD-PF-shared-discrepancy,456,200,20,3
+E2,R-BOCPD-PF-shared-discrepancy,456,400,20,3
+E2,R-BOCPD-PF-shared-discrepancy,456,600,20,3

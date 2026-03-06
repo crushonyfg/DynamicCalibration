@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import gpytorch
 from scipy.optimize import minimize
+from tqdm import tqdm
 
 Tensor = torch.Tensor
 
@@ -227,7 +228,7 @@ class BayesianProjectedCalibration:
 
         # (3) L2 projection for each eta draw => theta samples
         thetas = []
-        for s in range(n_eta_draws):
+        for s in tqdm(range(n_eta_draws), desc="L2 projection"):
             theta_s = project_theta_L2(
                 X_grid=X_grid,
                 eta_grid=eta_draws_np[s],
@@ -244,7 +245,9 @@ class BayesianProjectedCalibration:
         self.theta_var = thetas.var(axis=0)
 
         # (4) fit delta GP on residuals using theta_mean (your requested workflow)
-        resid = y - self.y_sim(X, self.theta_mean)
+        # resid = y - self.y_sim(X, self.theta_mean)
+        resid = y - self.y_sim(X, self.theta_mean).reshape(-1)
+        # print("BPC debug: ", resid.shape, y.shape, self.y_sim(X, self.theta_mean).shape)
         self.delta_gp, self.delta_lik = fit_delta_gp(X, resid, iters=gp_fit_iters, device=self.device)
 
     def predict(self, Xt: np.ndarray):

@@ -16,7 +16,8 @@ from .configs import CalibrationConfig
 from .emulator import DeterministicSimulator
 from .online_calibrator import OnlineBayesCalibrator, crps_gaussian
 from .bpc import BayesianProjectedCalibration
-from .bcp_bocpd import *
+from .bpc_bocpd import *
+from .restart_bocpd_debug_260115_gpytorch import RollingStats
 
 # -------------------------------------------------------------
 # Simulator (Config2)
@@ -37,6 +38,40 @@ def computer_model_config2_torch(x: torch.Tensor, theta: torch.Tensor) -> torch.
     return torch.sin(5.0 * theta[:, 0:1] * x[:, 0:1]) + 5.0 * x[:, 0:1]
 
 from scipy.interpolate import interp1d
+
+def build_phi2_of_theta_interp(theta_grid: np.ndarray):
+    """
+    Build interpolation phi2(theta) by inverting oracle_theta on a phi2 grid.
+    This mirrors the logic in your slope synthetic script: ensure theta*(t) corresponds
+    to a realizable physical phi2(t).
+
+    Returns: callable phi2_of_theta(theta) -> float
+    """
+    import numpy as np
+    from scipy.interpolate import interp1d
+
+    # choose a phi2 grid (wide enough)
+    phi2_grid = np.linspace(2.0, 12.0, 400)
+    phi_base = np.array([5.0, 0.0, 5.0], dtype=float)
+
+    # map phi2 -> theta*(phi)
+    theta_star_list = []
+    for phi2 in phi2_grid:
+        phi = phi_base.copy()
+        phi[1] = float(phi2)
+        th = oracle_theta(phi, theta_grid)
+        theta_star_list.append(th)
+
+    theta_star_arr = np.asarray(theta_star_list, dtype=float)
+
+    # theta_star_arr should be monotone-ish; if not, sort by theta for safe inversion
+    order = np.argsort(theta_star_arr)
+    theta_sorted = theta_star_arr[order]
+    phi2_sorted = phi2_grid[order]
+
+    # Invert by interpolation
+    f = interp1d(theta_sorted, phi2_sorted, kind="linear", fill_value="extrapolate", assume_sorted=True)
+    return lambda th: float(f(float(th)))
 
 def build_phi2_from_theta_star(
     phi2_grid: np.ndarray,
@@ -220,23 +255,23 @@ def run_one_slope(
 ):
     print(f"\n=== Running slope={slope:.4f} ===")
 
-    if mode == 0:
-        stream = SlopeDriftDataStream(
-            total_T=total_T,
-            batch_size=batch_size,
-            slope=slope,
-            seed=seed,
-        )
-    elif mode == 1:
-        stream = ThetaDrivenSlopeDataStream(
-        total_T=total_T,
-        batch_size=batch_size,
-        noise_sd=0.2,
-        theta0=1.6,                 # 起始 θ*
-        theta_slope=slope,          # 你想测试的 drift
-        phi2_of_theta=phi2_of_theta,
-        seed=seed,
-    )
+    # if mode == 0:
+    #     stream = SlopeDriftDataStream(
+    #         total_T=total_T,
+    #         batch_size=batch_size,
+    #         slope=slope,
+    #         seed=seed,
+    #     )
+    # elif mode == 1:
+    #     stream = ThetaDrivenSlopeDataStream(
+    #     total_T=total_T,
+    #     batch_size=batch_size,
+    #     noise_sd=0.2,
+    #     theta0=1.6,                 # 起始 θ*
+    #     theta_slope=slope,          # 你想测试的 drift
+    #     phi2_of_theta=phi2_of_theta,
+    #     seed=seed,
+    # )
 
     # theta prior
     def prior_sampler(N):
@@ -274,11 +309,21 @@ def run_one_slope(
         print(f"  -> {name}")
         t0 = time()
 
-        theta_hist, rmse_hist = [], []
+        theta_hist, rmse_hist, crps_hist = [], [], []
         total_obs = 0
         others_hist = []
         report_sub_hist = []
         theta_var_hist = []
+
+        dll_hist = []
+        mu_hist = []
+        sig_hist = []
+        h_hist = []
+        odds_hist = []
+        anchor_rl_hist = []
+        cand_rl_hist = []
+
+        top0_particles_hist = []
 
         if mode == 0:
             stream2 = SlopeDriftDataStream(
@@ -289,14 +334,14 @@ def run_one_slope(
             )
         elif mode == 1:
             stream2 = ThetaDrivenSlopeDataStream(
-            total_T=total_T,
-            batch_size=batch_size,
-            noise_sd=0.2,
-            theta0=1.6,                 # 起始 θ*
-            theta_slope=slope,          # 你想测试的 drift
-            phi2_of_theta=phi2_of_theta,
-            seed=seed,
-        )
+                total_T=total_T,
+                batch_size=batch_size,
+                noise_sd=0.2,
+                theta0=1.5,                 # 起始 θ*
+                theta_slope=slope,          # 你想测试的 drift
+                phi2_of_theta=phi2_of_theta,
+                seed=seed,
+            )
         
 
         # ---------- BOCPD ----------
@@ -304,9 +349,11 @@ def run_one_slope(
             cfg = CalibrationConfig()
             cfg.bocpd.bocpd_mode = meta["mode"]
             cfg.bocpd.use_restart = True
+            roll = RollingStats(window=50)
 
             if meta["mode"] == "restart":
                 cfg.model.use_discrepancy = meta["use_discrepancy"]
+                cfg.model.bocpd_use_discrepancy = meta["bocpd_use_discrepancy"]
 
             emulator = DeterministicSimulator(
                 func=computer_model_config2_torch,
@@ -335,16 +382,69 @@ def run_one_slope(
                     pred_comp = calib.predict_complete(Xb, Yb)
                     report_sub_hist = (pred_comp["crps_sim"].item(),pred_comp["experts_logpred"],pred_comp["var_sim"])
                     # print(name, total_obs, report_hist[-1])
-                    # rmse_hist.append(
-                    #     float(torch.sqrt(((pred["mu"] - Yb) ** 2).mean()))
-                    # )
                     rmse_hist.append(
-                        float(torch.sqrt(((pred["mu_sim"] - Yb) ** 2).mean()))
+                        float(torch.sqrt(((pred["mu"] - Yb) ** 2).mean()))
                     )
+                    crps = crps_gaussian(pred["mu"], pred["var"], Yb).mean()
+                    print(crps)
+                    crps_hist.append(crps.item())
+                    # rmse_hist.append(
+                    #     float(torch.sqrt(((pred["mu_sim"] - Yb) ** 2).mean()))
+                    # )
 
                 rec = calib.step_batch(Xb, Yb, verbose=False)
+
+                dll = rec.get("delta_ll_pair", None)
+                if dll is not None and np.isfinite(dll):
+                    roll.update(dll)
+
+                mu_hat = roll.mean()
+                sig_hat = roll.std()
+                h_log = rec.get("h_log", None)
+                log_odds = rec.get("log_odds_mass", None)
+                # print("debug: dll, mu_hat, sig_hat, h_log, log_odds",dll, mu_hat, sig_hat, h_log, log_odds)
+
+                dll_hist.append(dll)
+                mu_hist.append(mu_hat)
+                sig_hist.append(sig_hat)
+                h_hist.append(h_log)
+                odds_hist.append(log_odds)
+
+                anchor_rl_hist.append(rec.get("anchor_rl", None))
+                cand_rl_hist.append(rec.get("cand_rl", None))
+
                 mean_theta, var_theta, lo_theta, hi_theta = calib._aggregate_particles(0.9)
                 theta_hist.append(float(mean_theta[0]))
+
+                experts = calib.bocpd.experts
+
+                batch_particles = []
+                batch_weights = []
+                batch_logmass = []
+
+                for e in experts:
+                    # particles
+                    particles = e.pf.particles.theta          # (N,1)
+                    particles_1d = particles.squeeze(-1).detach().cpu()
+
+                    # weights
+                    pw = e.pf.particles.weights()             # (N,)
+                    pw_1d = pw.squeeze(-1).detach().cpu()
+
+                    # log mass
+                    log_mass = float(e.log_mass)
+
+                    batch_particles.append(particles_1d)
+                    batch_weights.append(pw_1d)
+                    batch_logmass.append(log_mass)
+
+                batch_dict = dict(
+                    particles=batch_particles,      # list length E
+                    weights=batch_weights,          # list length E
+                    log_mass=torch.tensor(batch_logmass)  # (E,)
+                )
+
+                top0_particles_hist.append(batch_dict)
 
                 ess_gini_info = []
                 for ei, e in enumerate(calib.bocpd.experts):
@@ -388,10 +488,12 @@ def run_one_slope(
                 # X_hist.append(Xb.numpy())
                 # y_hist.append(Yb.numpy())
                 if total_obs > 0 and bpc is not None:
-                    mu_np, var_np = bpc.predict_sim(Xb.detach().cpu().numpy())
+                    # mu_np, var_np = bpc.predict_sim(Xb.detach().cpu().numpy())
+                    mu_np, var_np = bpc.predict(Xb.detach().cpu().numpy())
                     mu_t, var_t = torch.tensor(mu_np, dtype=Yb.dtype, device=Yb.device), torch.tensor(var_np, dtype=Yb.dtype, device=Yb.device) 
                     rmse_hist.append(float(torch.sqrt(((mu_t - Yb) ** 2).mean())))
                     crps_sim = crps_gaussian(mu_t, var_t, Yb)
+                    crps_hist.append(crps_sim.item())
                     # print("bpc crps sim:", crps_sim)
 
                 X_all, y_all = X_hist, y_hist
@@ -412,6 +514,16 @@ def run_one_slope(
                 # print("bpc theta entropy:", entropy_info)
                 total_obs += batch_size
                 others_hist.append({"var": float(bpc.theta_var[0]), "entropy": entropy_info, "crps_sim": crps_sim})
+
+                theta_samples_bpc = torch.tensor(bpc.theta_samples).squeeze(-1)
+                top0_particles_hist.append(theta_samples_bpc)
+                batch_dict = dict(
+                    particles=[theta_samples_bpc],      # list length E
+                    weights=None,          # list length E
+                    log_mass=torch.tensor([0.0])  # (E,)
+                )
+
+                top0_particles_hist.append(batch_dict)
 
         # ---------- BPC + BOCPD ----------
         elif meta["type"] == "bpc_bocpd":
@@ -436,10 +548,12 @@ def run_one_slope(
                 Xb, Yb = stream2.next()
                 crps_sim = None
                 if total_obs > 0:
-                    mu, var = calib.predict_sim(Xb)
+                    # mu, var = calib.predict_sim(Xb)
+                    mu, var = calib.predict(Xb.detach().cpu().numpy())
                     mu_t, var_t = torch.tensor(mu, dtype=Yb.dtype, device=Yb.device), torch.tensor(var, dtype=Yb.dtype, device=Yb.device)
                     rmse_hist.append(float(torch.sqrt(((mu_t - Yb) ** 2).mean())))
                     crps_sim = crps_gaussian(mu_t, var_t, Yb)
+                    crps_hist.append(crps_sim.item())
                     # print("bocpd-bpc crps sim:", crps_sim)
                 info = calib.step_batch(Xb.detach().cpu().numpy(), Yb.detach().cpu().numpy())
 
@@ -459,20 +573,67 @@ def run_one_slope(
                 theta_hist.append(float(theta_mean[0]))
                 # print("bocpd-bpc theta var:", theta_var[0])
                 others_hist.append({"did_restart": info["did_restart"], "var": theta_var[0], "lo": theta_lo, "hi": theta_hi, "crps_sim": crps_sim})
+
+                batch_particles = []
+                batch_weights = []
+                batch_logmass = []
+                for e in calib.experts:
+                    particles = torch.tensor(e.bpc.theta_samples).squeeze(-1)
+                    batch_logmass.append(e.logw)          # (N,1)
+                    batch_particles.append(particles)
+
+                batch_dict = dict(
+                    particles=batch_particles,      # list length E
+                    weights=batch_weights,          # list length E
+                    log_mass=torch.tensor(batch_logmass)  # (E,)
+                )
+
+                top0_particles_hist.append(batch_dict)
                 # print(theta_mean, theta_var[0], theta_lo, theta_hi)
 
         # ---------- oracle ----------
-        phi_hist = stream.phi_history[: len(theta_hist)]
+        phi_hist = stream2.phi_history[: len(theta_hist)]
         oracle_hist = [
             oracle_theta(phi, theta_grid) for phi in phi_hist
         ]
+        if meta["type"] == "bocpd":
+            results[name] = dict(
+                    theta=np.array(theta_hist),
+                    theta_oracle=np.array(oracle_hist),
+                    others=others_hist,
+                    rmse=np.array(rmse_hist),
+                    top0_particles_hist=top0_particles_hist,
+                    seed=seed,
+                    batch_size=batch_size,
+                    slope=slope,
+                    mode=mode,
+                    oracle_hist=oracle_hist,
+                    phi_hist=phi_hist,
+                    delta_ll_hist=np.array(dll_hist),
+                    mu_hat_hist=np.array(mu_hist),
+                    sigma_hat_hist=np.array(sig_hist),
+                    h_log_hist=np.array(h_hist),
+                    log_odds_hist=np.array(odds_hist),
+                    anchor_rl_hist=np.array(anchor_rl_hist),
+                    cand_rl_hist=np.array(cand_rl_hist),
+                    crps_hist=np.array(crps_hist),
+                )
+        else:
+            results[name] = dict(
+                    theta=np.array(theta_hist),
+                    theta_oracle=np.array(oracle_hist),
+                    others=others_hist,
+                    rmse=np.array(rmse_hist),
+                    top0_particles_hist=top0_particles_hist,
+                    seed=seed,
+                    batch_size=batch_size,
+                    slope=slope,
+                    mode=mode,
+                    oracle_hist=oracle_hist,
+                    phi_hist=phi_hist,
+                    crps_hist=np.array(crps_hist),
+                )
 
-        results[name] = dict(
-                theta=np.array(theta_hist),
-                theta_oracle=np.array(oracle_hist),
-                others=others_hist,
-                rmse=np.array(rmse_hist),
-            )
         if mode == 1:
             results[name]["theta_star_true"] = np.array(stream2.theta_star_history)
 
@@ -490,12 +651,23 @@ def run_one_slope(
 # -------------------------------------------------------------
 def main():
     # seeds = [0, 123, 456, 789]
-    seeds = [456]
-    batch_sizes = [10, 20, 40]
-    slopes = [0.001, 0.002, 0.003, 0.005, 0.008, 0.01]
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true", default=False)
+    parser.add_argument("--out_dir", type=str, default="figs/slope_deltaCmp_v2")
+    args = parser.parse_args()
+
+    if args.debug:
+        seeds = [456]
+        batch_sizes = [10]
+        slopes = [0.001]
+    else:
+        seeds = [456]
+        batch_sizes = [10, 20, 40]
+        slopes = [0.0005, 0.001, 0.0015, 0.002, 0.0025]
     # batch_sizes = [20]
     # slopes = [0.003]
-    store_dir = "figs/slope_deltaCmp_v1"
+    store_dir = args.out_dir
     import os
     os.makedirs(store_dir, exist_ok=True)
 
@@ -512,12 +684,12 @@ def main():
         phi2_of_theta = None
 
     methods = {
-        "BPC-80": dict(type="bpc"),
-        "BOCPD-BPC": dict(type="bpc_bocpd"),
-        "BOCPD-PF": dict(type="bocpd", mode="standard"),
-        "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
-        "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False),
         # "BPC-80": dict(type="bpc"),
+        # "BOCPD-BPC": dict(type="bpc_bocpd"),
+        "BOCPD-PF": dict(type="bocpd", mode="standard"),
+        "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True, bocpd_use_discrepancy=True),
+        "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
+        "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
     }
 
     all_results = {}

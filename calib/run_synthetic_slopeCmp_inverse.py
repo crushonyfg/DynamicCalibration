@@ -212,6 +212,40 @@ def oracle_theta(phi: np.ndarray, grid: np.ndarray) -> float:
 
     return grid[np.argmin(errs)]
 
+def build_phi2_of_theta_interp(theta_grid: np.ndarray):
+    """
+    Build interpolation phi2(theta) by inverting oracle_theta on a phi2 grid.
+    This mirrors the logic in your slope synthetic script: ensure theta*(t) corresponds
+    to a realizable physical phi2(t).
+
+    Returns: callable phi2_of_theta(theta) -> float
+    """
+    import numpy as np
+    from scipy.interpolate import interp1d
+
+    # choose a phi2 grid (wide enough)
+    phi2_grid = np.linspace(2.0, 12.0, 400)
+    phi_base = np.array([5.0, 0.0, 5.0], dtype=float)
+
+    # map phi2 -> theta*(phi)
+    theta_star_list = []
+    for phi2 in phi2_grid:
+        phi = phi_base.copy()
+        phi[1] = float(phi2)
+        th = oracle_theta(phi, theta_grid)
+        theta_star_list.append(th)
+
+    theta_star_arr = np.asarray(theta_star_list, dtype=float)
+
+    # theta_star_arr should be monotone-ish; if not, sort by theta for safe inversion
+    order = np.argsort(theta_star_arr)
+    theta_sorted = theta_star_arr[order]
+    phi2_sorted = phi2_grid[order]
+
+    # Invert by interpolation
+    f = interp1d(theta_sorted, phi2_sorted, kind="linear", fill_value="extrapolate", assume_sorted=True)
+    return lambda th: float(f(float(th)))
+
 
 # -------------------------------------------------------------
 # Run one slope experiment

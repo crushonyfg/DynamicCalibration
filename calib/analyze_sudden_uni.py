@@ -172,12 +172,12 @@ def analyze_sudden_uni(
 
     # -------- load main data (prefix1) --------
     data = torch.load(
-        f"sudden_grid_outputs/{prefix1}/sudden_{tag}_results.pt",
+        f"figs/sudden_grid_outputs/{prefix1}/sudden_{tag}_results.pt",
         weights_only=False
     )
 
     theta_stars = torch.load(
-        f"sudden_grid_outputs/{prefix1}/sudden_{tag}_phi_oracle.pt",
+        f"figs/sudden_grid_outputs/{prefix1}/sudden_{tag}_phi_oracle.pt",
         weights_only=False
     )
 
@@ -296,24 +296,78 @@ def analyze_sudden_uni(
     count_true, avg_interval = restart_stats("R-BOCPD-PF-nodiscrepancy")
     count_true1, avg_interval1 = restart_stats("R-BOCPD-PF-usediscrepancy")
 
+    y_crps_all = {}
+
+    for name in data.keys():
+        crps = []
+        if "BOCPD-PF" not in name:
+            for i in range(1,len(data[name]["others"])):
+                crps.append(data[name]["others"][i]["crps_sim"].mean().item())
+            y_crps_all[name] = np.mean(crps)
+        else:
+            for i in range(1, len(data[name]["others"])):
+                crps.append(data[name]["others"][i]["report_sub_hist"][0])
+            y_crps_all[name] = np.mean(crps)
+
+    from scipy.stats import norm
+
+    def gaussian_crps_1d(mu, var, y):
+        sigma = np.sqrt(max(var, 1e-12))
+        z = (y - mu) / sigma
+        return sigma * (
+            z * (2 * norm.cdf(z) - 1)
+            + 2 * norm.pdf(z)
+            - 1.0 / np.sqrt(np.pi)
+        )
+            
+    
+    theta_crps_dict = {}
+    for name in data.keys():
+        theta_vars = []
+        pf_infos = []
+        for i in range(len(data[name]["others"])):
+            var = data[name]["others"][i]["var"]
+            try:
+                gini, ess, unique, entropy = data[name]["others"][i]["pf_info"][0]["gini"], \
+                    data[name]["others"][i]["pf_info"][0]["ess"], data[name]["others"][i]["pf_health_info"][0]["unique_ratio"], \
+                        data[name]["others"][i]["pf_health_info"][0]["entropy_1d_histogram"]
+            except:
+                # entropy = data[name]["others"][i]["entropy"]
+                entropy = None
+                gini, ess, unique = None, None, None
+            theta_vars.append(var)
+            pf_infos.append((gini, ess, unique, entropy))
+        theta_n = np.asarray(data[name]["theta"], dtype=float)
+        theta_vars = np.asarray(theta_vars, dtype=float)
+        theta_crps_list = [
+        gaussian_crps_1d(theta_n[t], theta_vars[t], oracle_hist[t])
+        for t in range(len(oracle_hist))
+            ]
+        theta_crps = np.mean(theta_crps_list)
+        theta_crps_dict[name] = theta_crps
+
     return {
         "rmse": [names, rmse_mean, rmse_var, rmse_std],
         "theta": [names, theta_rmse_all, coverage_all, lo_all, hi_all],
         "restart": [count_true, avg_interval],
         "restart1": [count_true1, avg_interval1],
+        "y-crps": y_crps_all,
+        "theta_crps": theta_crps_dict
     }
 
 
 def main():
     import itertools
 
-    prefix1 = "v4"
-    prefix2 = "v5_nodiscrepancy_usediscrepancy"   # or None
-    prefix3 = "v5_nodiscrepancy_usediscrepancy_merge"
+    # prefix1 = "v4"
+    # prefix2 = "v5_nodiscrepancy_usediscrepancy"   # or None
+    # prefix3 = "v5_nodiscrepancy_usediscrepancy_merge"
+    prefix1 = "v1"
+    prefix2, prefix3 = None, None
 
     seeds = [456]
     batch_sizes = [20, 40]
-    seg_lens = [40, 120, 200]
+    seg_lens = [80, 120, 200]
     # seg_lens = [200]
     magnitudes = [0.5, 1.0, 2.0, 3.0]
 
@@ -326,6 +380,8 @@ def main():
             prefix1, prefix2, prefix3
         )
 
+    if prefix3 is None:
+        prefix3 = prefix1
     torch.save(results, f"figs/sudden_{prefix3}/sudden_{prefix3}_results.pt")
     return results
 

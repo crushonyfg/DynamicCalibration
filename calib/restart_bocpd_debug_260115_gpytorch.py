@@ -29,6 +29,32 @@ class Expert:
     y_hist: torch.Tensor     # [M]
 
 
+# calib/diagnostics_llr.py
+from collections import deque
+import numpy as np
+import math
+
+class RollingStats:
+    def __init__(self, window: int = 50):
+        self.window = int(window)
+        self.buf = deque(maxlen=self.window)
+
+    def update(self, x: float):
+        self.buf.append(float(x))
+
+    def mean(self) -> float:
+        if len(self.buf) == 0:
+            return float("nan")
+        return float(np.mean(self.buf))
+
+    def std(self) -> float:
+        if len(self.buf) == 0:
+            return float("nan")
+        return float(np.std(self.buf, ddof=1)) if len(self.buf) >= 2 else 0.0
+
+    def n(self) -> int:
+        return len(self.buf)
+
 class BOCPD:
     """
     Restart-BOCPD implementation used as `RestartBOCPD` in OnlineBayesCalibrator.
@@ -193,7 +219,8 @@ class BOCPD:
                 model_cfg.rho,
                 model_cfg.sigma_eps,
                 need_grads=False,
-                use_discrepancy=model_cfg.use_discrepancy,
+                # use_discrepancy=model_cfg.use_discrepancy,
+                use_discrepancy=model_cfg.bocpd_use_discrepancy,
             )
             # info["loglik"]: [batch_size, N]
             loglik = torch.clamp(info["loglik"], min=-1e10, max=1e10)
@@ -271,7 +298,19 @@ class BOCPD:
 
         # 1) per-expert log UMP over batch
         log_umps = self.ump_batch(X_batch, Y_batch, emulator, model_cfg)
+        log_ump_map = {id(e): float(lu) for e, lu in zip(self.experts, log_umps)}
         log_umps_t = torch.tensor(log_umps, device=self.device, dtype=self.dtype)
+
+        # === Snapshot BEFORE any mass update / append / prune / restart ===
+        experts_pre = list(self.experts)                 # old experts only
+        log_umps_pre = list(log_umps)                    # aligned with experts_pre
+        idx_pre = {id(e): i for i, e in enumerate(experts_pre)}
+
+        # We cannot select anchor/cand yet because they depend on t_now and masses,
+        # but we can provide a helper to fetch log_ump later for any pre-expert:
+        def get_pre_log_ump(e):
+            j = idx_pre.get(id(e), None)
+            return None if j is None else float(log_umps_pre[j])
 
         # 2) mass update
         prev_log_mass = torch.tensor(
@@ -560,6 +599,53 @@ class BOCPD:
                     f"mass={info['mass']:.4g}, log_ump={info['log_ump']}"
                 )
 
+        
+        # === LLR diagnostics consistent with BOCPD decision timing ===
+        def _single_expert_log_ump(e: Expert) -> float:
+            ps: ParticleSet = e.pf.particles
+            info = loglik_and_grads(
+                Y_batch, X_batch, ps, emulator,
+                e.delta_state, model_cfg.rho, model_cfg.sigma_eps,
+                need_grads=False, use_discrepancy=model_cfg.use_discrepancy,
+            )
+            loglik = torch.clamp(info["loglik"], min=-1e10, max=1e10)
+            logmix = torch.logsumexp(ps.logw.view(1, -1) + loglik, dim=1)
+            return float(logmix.mean().item())
+
+        log_ump_anchor = None
+        log_ump_cand = None
+
+        if anchor_e is not None:
+            log_ump_anchor = get_pre_log_ump(anchor_e)
+            if log_ump_anchor is None:
+                # anchor might have been replaced by closest-by-runlength after append/prune
+                log_ump_anchor = _single_expert_log_ump(anchor_e)
+
+        if cand_e is not None:
+            log_ump_cand = get_pre_log_ump(cand_e)
+            if log_ump_cand is None:
+                # very common: cand is the newly spawned run_length=0 expert
+                log_ump_cand = _single_expert_log_ump(cand_e)
+
+        delta_ll_pair = None
+        if (log_ump_anchor is not None) and (log_ump_cand is not None):
+            delta_ll_pair = float(log_ump_cand - log_ump_anchor)
+
+        # log posterior odds used by restart condition (mass already updated)
+        log_odds_mass = None
+        if anchor_e is not None and cand_e is not None:
+            log_odds_mass = float(cand_e.log_mass - anchor_e.log_mass)
+
+        h_log = float(math.log1p(self.restart_margin))
+
+        out = dict(
+            delta_ll_pair=delta_ll_pair,
+            log_odds_mass=log_odds_mass,
+            h_log=h_log,
+            log_ump_anchor=log_ump_anchor,
+            log_ump_cand=log_ump_cand,
+        )
+
         return {
             "p_anchor": p_anchor,
             "p_cp": p_cp,
@@ -574,6 +660,9 @@ class BOCPD:
             "log_Z": float(log_Z),
             "entropy": float(entropy),
             "experts_debug": experts_debug,
+            "anchor_rl": int(anchor_e.run_length) if anchor_e is not None else None,
+            "cand_rl": int(cand_e.run_length) if cand_e is not None else None,
+            **out,
         }
 
     # ------------------------------------------------------------------

@@ -1,0 +1,3 @@
+experiment,method,seed,restarts,first_restart,mean_restart_gap
+E3,R-BOCPD-PF-nodiscrepancy,456,0,,
+E3,R-BOCPD-PF-shared-discrepancy,456,11,100,70.0

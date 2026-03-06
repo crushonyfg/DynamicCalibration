@@ -263,11 +263,66 @@ def analyze_slope_uni(s, seed, batch_size, prefix1, prefix2=None, prefix3=None):
     count_true, avg_interval = restart_stats("R-BOCPD-PF-nodiscrepancy")
     count_true1, avg_interval1 = restart_stats("R-BOCPD-PF-usediscrepancy")
 
+    y_crps_all = {}
+
+    for name in data.keys():
+        crps = []
+        if "BOCPD-PF" not in name:
+            for i in range(1,len(data[name]["others"])):
+                crps.append(data[name]["others"][i]["crps_sim"].mean().item())
+            y_crps_all[name] = np.mean(crps)
+        else:
+            for i in range(1, len(data[name]["others"])):
+                crps.append(data[name]["others"][i]["report_sub_hist"][0])
+            y_crps_all[name] = np.mean(crps)
+
+    from scipy.stats import norm
+
+    def gaussian_crps_1d(mu, var, y):
+        sigma = np.sqrt(max(var, 1e-12))
+        z = (y - mu) / sigma
+        return sigma * (
+            z * (2 * norm.cdf(z) - 1)
+            + 2 * norm.pdf(z)
+            - 1.0 / np.sqrt(np.pi)
+        )
+            
+    
+    theta_crps_dict = {}
+    for name in data.keys():
+        theta_vars = []
+        pf_infos = []
+        for i in range(len(data[name]["others"])):
+            var = data[name]["others"][i]["var"]
+            try:
+                gini, ess, unique, entropy = data[name]["others"][i]["pf_info"][0]["gini"], \
+                    data[name]["others"][i]["pf_info"][0]["ess"], data[name]["others"][i]["pf_health_info"][0]["unique_ratio"], \
+                        data[name]["others"][i]["pf_health_info"][0]["entropy_1d_histogram"]
+            except:
+                # entropy = data[name]["others"][i]["entropy"]
+                entropy = None
+                gini, ess, unique = None, None, None
+            theta_vars.append(var)
+            pf_infos.append((gini, ess, unique, entropy))
+        theta_n = np.asarray(data[n]["theta"], dtype=float)
+        theta_vars = np.asarray(theta_vars, dtype=float)
+        theta_crps_list = [
+        gaussian_crps_1d(theta_n[t], theta_vars[t], oracle_hist[t])
+        for t in range(len(oracle_hist))
+            ]
+        theta_crps = np.mean(theta_crps_list)
+        theta_crps_dict[name] = theta_crps
+        # print(name, theta_crps)
+        
+
+
     return {
         "rmse": [names, rmse_mean, rmse_var, rmse_std],
         "theta": [names, theta_rmse_all, coverage_all, lo_all, hi_all],
         "restart": [count_true, avg_interval],
         "restart1": [count_true1, avg_interval1],
+        "y-crps": y_crps_all,
+        "theta_crps": theta_crps_dict
     }
 
 
@@ -277,12 +332,21 @@ def main():
     # prefix1 = "v5"
     # prefix2 = "v6"        # or e.g. "v6_alt"
     # prefix3 = "v6_merge"  # output folder
-    prefix1 = "v5_inverse"
-    prefix2, prefix3 = None, None
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prefix1", type=str, default="deltaCmp_v1")
+    parser.add_argument("--prefix2", type=str, default=None)
+    parser.add_argument("--prefix3", type=str, default=None)
+    parser.add_argument("--slopes", type=str, default=[0.0005, 0.001, 0.0015, 0.002, 0.0025])
+    parser.add_argument("--bcs", type=str, default=[10, 20, 40])
+    parser.add_argument("--seeds", type=str, default=[456])
+    args = parser.parse_args()
+    prefix1 = args.prefix1
+    prefix2, prefix3 = args.prefix2, args.prefix3
 
-    slopes = [0.001, 0.002, 0.003, 0.005, 0.008, 0.01]
-    bcs = [10, 20, 40]
-    seeds = [456]
+    slopes = [float(s) for s in args.slopes]
+    bcs = [int(bc) for bc in args.bcs]
+    seeds = [int(seed) for seed in args.seeds]
 
     results = {}
     for slope, bc, seed in itertools.product(slopes, bcs, seeds):

@@ -1,0 +1,2 @@
+method,theta_track_rmse,pred_rmse_sim,pred_crps_sim,pred_rmse_full,pred_crps_full,avg_delay,n_gt_cp,n_det_cp,n_false_alarms
+R-BOCPD-PF-halfdiscrepancy,1.2183592733520379,0.23389030605345904,0.1729729998879673,0.13510827472914513,nan,0.5,2,2,0

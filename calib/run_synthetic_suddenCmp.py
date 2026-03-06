@@ -18,7 +18,7 @@ from .configs import CalibrationConfig
 from .emulator import DeterministicSimulator
 from .online_calibrator import OnlineBayesCalibrator, crps_gaussian
 from .bpc import BayesianProjectedCalibration
-from .bcp_bocpd import *  # StandardBOCPD_BPC
+from .bpc_bocpd import *  # StandardBOCPD_BPC
 
 
 # -------------------------------------------------------------
@@ -221,6 +221,8 @@ def run_one_sudden(
         rmse_hist: List[float] = []
         others_hist: List[dict] = []
         total_obs = 0
+        top0_particles_hist = []
+
 
         # fresh stream per method (same data given same seed)
         stream = SuddenChangeDataStream(
@@ -283,6 +285,50 @@ def run_one_sudden(
                     entropy_1d_histogram = float(ps.entropy_1d_histogram())
                     # print(ei, unique_ratio, entropy_1d_histogram)
                     ess_gini_info.append({"expert_id": ei, "unique_ratio": unique_ratio, "entropy_1d_histogram": entropy_1d_histogram})
+
+                # experts = calib.bocpd.experts
+
+                # weights = torch.tensor([e.log_mass for e in experts])
+                # top_idx = torch.argmax(weights).item()
+                # top_expert = experts[top_idx]
+
+                # particles = top_expert.pf.particles.theta  
+                # pw = top_expert.pf.particles.weights()
+
+                # particles_1d = particles.squeeze(-1).detach().cpu()
+                # pw_1d = pw.squeeze(-1).detach().cpu()
+
+                # top0_particles_hist.append((particles_1d, pw_1d))
+
+                experts = calib.bocpd.experts
+
+                batch_particles = []
+                batch_weights = []
+                batch_logmass = []
+
+                for e in experts:
+                    # particles
+                    particles = e.pf.particles.theta          # (N,1)
+                    particles_1d = particles.squeeze(-1).detach().cpu()
+
+                    # weights
+                    pw = e.pf.particles.weights()             # (N,)
+                    pw_1d = pw.squeeze(-1).detach().cpu()
+
+                    # log mass
+                    log_mass = float(e.log_mass)
+
+                    batch_particles.append(particles_1d)
+                    batch_weights.append(pw_1d)
+                    batch_logmass.append(log_mass)
+
+                batch_dict = dict(
+                    particles=batch_particles,      # list length E
+                    weights=batch_weights,          # list length E
+                    log_mass=torch.tensor(batch_logmass)  # (E,)
+                )
+
+                top0_particles_hist.append(batch_dict)
 
                 others_hist.append(
                     dict(
@@ -355,6 +401,16 @@ def run_one_sudden(
                     )
                 )
 
+                theta_samples_bpc = torch.tensor(bpc.theta_samples).squeeze(-1)
+                top0_particles_hist.append(theta_samples_bpc)
+                batch_dict = dict(
+                    particles=[theta_samples_bpc],      # list length E
+                    weights=None,          # list length E
+                    log_mass=torch.tensor([0.0])  # (E,)
+                )
+
+                top0_particles_hist.append(batch_dict)
+
                 total_obs += bs
 
         # ---------- BPC + BOCPD ----------
@@ -389,7 +445,10 @@ def run_one_sudden(
 
                 theta_hist.append(float(theta_mean[0]))
                 # theta_var could be vector or cov; keep first dim scalar
-                v0 = float(theta_var[0]) if np.ndim(theta_var) >= 1 else float(theta_var)
+                try:
+                    v0 = float(theta_var[0][0]) if np.ndim(theta_var) >= 1 else float(theta_var)
+                except:
+                    v0 = theta_var
 
                 others_hist.append(
                     dict(
@@ -402,6 +461,22 @@ def run_one_sudden(
                         crps_sim=crps_sim,
                     )
                 )
+
+                batch_particles = []
+                batch_weights = []
+                batch_logmass = []
+                for e in calib.experts:
+                    particles = torch.tensor(e.bpc.theta_samples).squeeze(-1)
+                    batch_logmass.append(e.logw)          # (N,1)
+                    batch_particles.append(particles)
+
+                batch_dict = dict(
+                    particles=batch_particles,      # list length E
+                    weights=batch_weights,          # list length E
+                    log_mass=torch.tensor(batch_logmass)  # (E,)
+                )
+
+                top0_particles_hist.append(batch_dict)
 
                 total_obs += bs
 
@@ -429,6 +504,7 @@ def run_one_sudden(
             delta_mag=float(delta_mag),
             batch_size=bs,
             seed=int(seed),
+            top0_particles_hist=top0_particles_hist,
         )
 
         print(f"     done in {time() - t0:.1f}s")
@@ -475,19 +551,32 @@ def plot_theta_tracking(
 # 3 changepoints per run, phi centered around 7.5
 # -------------------------------------------------------------
 def main():
-    out_dir = "./figs/sudden_grid_outputs/v1"
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true", default=False)
+    parser.add_argument("--out_dir", type=str, default="./figs/sudden_grid_outputs/v1")
+    args = parser.parse_args()
+
+    out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
 
     # --- experimental grid ---
-    seeds = [456]               # you can add more
-    batch_sizes = [20, 40]      # you can add more
+    if args.debug:
+        seeds = [456]               # you can add more
+        batch_sizes = [20]      # you can add more
+        seg_lens = [120]
+        magnitudes = [2.0] 
+    else:
+        magnitudes = [0.5, 1.0, 2.0, 3.0, 5.0]
+        seeds = [456]               # you can add more
+        batch_sizes = [20, 40]      # you can add more
 
-    # frequency: segment length L in observation-time units
-    # NOTE: must be divisible by batch_size (enforced in run_one_sudden)
-    seg_lens = [80, 120, 200]  # frequency: smaller => more frequent CPs
+        # frequency: segment length L in observation-time units
+        # NOTE: must be divisible by batch_size (enforced in run_one_sudden)
+        seg_lens = [80, 120, 200]  # frequency: smaller => more frequent CPs
 
-    # magnitude: delta applied to phi[1] around center=7.5
-    magnitudes = [0.5, 1.0, 2.0, 3.0, 5.0]
+        # magnitude: delta applied to phi[1] around center=7.5
+        magnitudes = [0.5, 1.0, 2.0, 3.0, 5.0]
 
     # methods
     methods = {

@@ -1,0 +1,11 @@
+experiment,method,seed,total_T,restarts,first_restart,mean_restart_gap
+E1,R-BOCPD-PF-nodiscrepancy,0,800,0,,
+E1,R-BOCPD-PF-nodiscrepancy,1,800,0,,
+E1,R-BOCPD-PF-nodiscrepancy,2,800,0,,
+E1,R-BOCPD-PF-nodiscrepancy,3,800,0,,
+E1,R-BOCPD-PF-nodiscrepancy,4,800,0,,
+E1,R-BOCPD-PF-shared-discrepancy,0,800,0,,
+E1,R-BOCPD-PF-shared-discrepancy,1,800,0,,
+E1,R-BOCPD-PF-shared-discrepancy,2,800,0,,
+E1,R-BOCPD-PF-shared-discrepancy,3,800,1,800,
+E1,R-BOCPD-PF-shared-discrepancy,4,800,0,,
