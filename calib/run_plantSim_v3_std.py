@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -8,11 +9,16 @@ from tqdm import tqdm
 # -------------------------------------------------------------
 # Your existing modules (keep same as before)
 # -------------------------------------------------------------
-from .configs import CalibrationConfig
+from .configs import CalibrationConfig, BOCPDConfig, ModelConfig
 from .emulator import DeterministicSimulator
 from .online_calibrator import OnlineBayesCalibrator, crps_gaussian
 from .bpc import BayesianProjectedCalibration
 from .bpc_bocpd import *
+from .restart_bocpd_ogp_gpytorch import (
+    BOCPD_OGP, OGPPFConfig, OGPParticleFilter,
+    RollingStats as OGPRollingStats,
+    make_fast_batched_grad_func,
+)
 
 from .Deal_data import *
 from tqdm import tqdm
@@ -327,6 +333,96 @@ class PlantEmulatorNNStd:
         raise ValueError(f"Unsupported shapes: x={tuple(x.shape)}, theta={tuple(theta.shape)}")
 
 
+def batch_X_base_to_s(gt: GlobalTransformSep, Xb: np.ndarray) -> torch.Tensor:
+    Xs = gt.X_base_to_s(Xb).astype(np.float64)      # (B,5)
+    return torch.tensor(Xs, dtype=torch.float64)
+
+def batch_y_to_s(gt: GlobalTransformSep, yb: np.ndarray) -> torch.Tensor:
+    ys = gt.y_raw_to_s(yb).astype(np.float64)       # (B,)
+    return torch.tensor(ys, dtype=torch.float64)
+
+
+# =========================
+# PlantEmulatorNNStdTorch: Pure-torch differentiable for OGP
+# =========================
+from calib.emulator import Emulator
+
+
+class PlantEmulatorNNStdTorch(Emulator):
+    """
+    Pure-torch differentiable wrapper for standardized NN.
+    Works in standardized space: x_base_s [5], theta_s [1] -> y_s.
+    """
+    _NN_CHUNK = 8192
+
+    def __init__(self, nn_std: NNModelTorchStd, gt: GlobalTransformSep,
+                 device: str = "cuda", dtype= torch.float64):
+        self.device = device
+        self.dtype = dtype
+        self.gt = gt
+        self.nn = nn_std.model.to(device)
+        self.nn.eval()
+        for p in self.nn.parameters():
+            p.requires_grad_(False)
+
+    def _forward_y_s(self, x_full_s: torch.Tensor) -> torch.Tensor:
+        """x_full_s [M, 6] standardized -> y_s [M]. Differentiable."""
+        return self.nn(x_full_s.float()).to(self.dtype)
+
+    def predict(self, x: torch.Tensor, theta: torch.Tensor):
+        """x [B, 5] x_base_s, theta [N, 1] theta_s -> (mu [B,N], var [B,N])"""
+        B, N = x.shape[0], theta.shape[0]
+        x_dev = x.to(device=self.device, dtype=self.dtype)
+        th_dev = theta.to(device=self.device, dtype=self.dtype)
+        x_rep = x_dev.unsqueeze(1).expand(B, N, -1).reshape(B * N, -1)
+        th_rep = th_dev.unsqueeze(0).expand(B, N, -1).reshape(B * N, -1)
+        x_full = torch.cat([x_rep, th_rep], dim=1)
+        total = B * N
+        with torch.no_grad():
+            if total <= self._NN_CHUNK:
+                y = self._forward_y_s(x_full)
+            else:
+                y = torch.empty(total, device=self.device, dtype=self.dtype)
+                for i in range(0, total, self._NN_CHUNK):
+                    j = min(i + self._NN_CHUNK, total)
+                    y[i:j] = self._forward_y_s(x_full[i:j])
+        mu = y.reshape(B, N)
+        return mu, torch.zeros_like(mu)
+
+    def sim_func(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        """One-to-one: x [M,5], theta [M,1] -> y [M]. Differentiable."""
+        x_full = torch.cat([x.to(self.dtype), theta.to(self.dtype)], dim=1)
+        return self._forward_y_s(x_full)
+
+    def x_domain_from_scaler(self, dx: int = 5):
+        """Auto-compute x_domain in STANDARDIZED space: mean ± 3*std."""
+        x_mean = self.gt.x_base_scaler.mean_
+        x_std = self.gt.x_base_scaler.scale_
+        lo = x_mean[:dx] - 3 * x_std[:dx]
+        hi = x_mean[:dx] + 3 * x_std[:dx]
+        return [(float(lo[i]), float(hi[i])) for i in range(dx)]
+
+
+def _aggregate_ogp_particles(bocpd, ci=0.9):
+    all_theta, all_w = [], []
+    for e in bocpd.experts:
+        w_e = math.exp(e.log_mass)
+        all_theta.append(e.pf.theta)
+        all_w.append(e.pf.weights() * w_e)
+    theta_cat = torch.cat(all_theta, dim=0)
+    w_cat = torch.cat(all_w, dim=0)
+    w_cat = w_cat / w_cat.sum()
+    mean_th = (w_cat.unsqueeze(1) * theta_cat).sum(dim=0)
+    var_th = (w_cat.unsqueeze(1) * (theta_cat - mean_th).pow(2)).sum(dim=0)
+    alpha = (1 - ci) / 2
+    sorted_th, sorted_idx = torch.sort(theta_cat, dim=0)
+    sorted_w = w_cat[sorted_idx.squeeze()]
+    cum_w = torch.cumsum(sorted_w, dim=0)
+    lo_idx = (cum_w >= alpha).nonzero(as_tuple=True)[0][0]
+    hi_idx = (cum_w >= 1 - alpha).nonzero(as_tuple=True)[0][0]
+    return mean_th, var_th, sorted_th[lo_idx], sorted_th[hi_idx]
+
+
 # =========================
 # 6) Helper: build standardized batches
 # =========================
@@ -411,45 +507,202 @@ def run_plantSim(mode, methods, batch_size):
         else:
             stream = StreamClass(mode, folder)
 
-        cfg = CalibrationConfig()
-        cfg.bocpd.bocpd_mode = meta["mode"]
-        cfg.bocpd.use_restart = True
+        # ---------- R-BOCPD-PF-OGP ----------
+        if name == "R-BOCPD-PF-OGP":
+            ogp_dev = "cuda"
+            emulator_nn_std = PlantEmulatorNNStdTorch(nn_std, gt, device=ogp_dev)
+            grad_func = make_fast_batched_grad_func(
+                emulator_nn_std.sim_func, device=ogp_dev, dtype=torch.float64,
+            )
+            x_domain = emulator_nn_std.x_domain_from_scaler(dx=5)
+            a_s = (3.0 - gt.theta_mu) / gt.theta_sd
+            b_s = (21.0 - gt.theta_mu) / gt.theta_sd
+            ogp_cfg = OGPPFConfig(
+                num_particles=1024,
+                x_domain=x_domain,
+                theta_lo=torch.tensor([a_s]),
+                theta_hi=torch.tensor([b_s]),
+                theta_move_std=0.5 / gt.theta_sd,
+                ogp_quad_n=3,
+                particle_chunk_size=64,
+                max_hist=200,
+            )
+            bocpd_cfg = BOCPDConfig()
+            bocpd_cfg.use_restart = True
+            model_cfg = ModelConfig(rho=1.0, sigma_eps=gt.y_scaler.scale_[0])
+            roll = OGPRollingStats(window=50)
 
-        if meta["mode"] == "restart":
-            cfg.model.use_discrepancy = meta["use_discrepancy"]
+            bocpd = BOCPD_OGP(
+                config=bocpd_cfg,
+                ogp_pf_cfg=ogp_cfg,
+                batched_grad_func=grad_func,
+                device=ogp_dev,
+            )
 
-        calib = OnlineBayesCalibrator(cfg, emulator, prior_sampler)
-        for Xb, yb, thb in tqdm(batches(stream, batch_size), desc=f"Running {name}"):
-            # standardized inputs for PF/BOCPD
-            newX = batch_X_base_to_s(gt, Xb)    # (B,5) standardized; DO NOT include thb
-            newY = batch_y_to_s(gt, yb)         # (B,) standardized
+            for Xb, yb, thb in tqdm(batches(stream, batch_size), desc=f"Running {name}"):
+                newX = batch_X_base_to_s(gt, Xb).to(device=ogp_dev)
+                newY = batch_y_to_s(gt, yb).to(device=ogp_dev)
+                gt_theta = torch.tensor(thb)
 
-            # prediction RMSE in raw revenue space
-            if idx > 0:
-                pred = calib.predict_batch(newX)           # pred["mu"] is y_s
-                pred_comp = calib.predict_complete(newX, newY)
-                mu_s = pred["mu"].detach().cpu().numpy()
-                mu_raw = gt.y_s_to_raw(mu_s)
-                rmse = float(np.sqrt(np.mean((mu_raw - np.asarray(yb))**2)))
-                rmse_hist.append(rmse)
-                report_sub_hist = (pred_comp["crps_sim"].item(),pred_comp["experts_logpred"],pred_comp["var_sim"])
-                comp_rmse_hist.append(report_sub_hist)
+                if idx > 0 and len(bocpd.experts) > 0:
+                    mix_mu = torch.zeros(newX.shape[0], device=ogp_dev, dtype=torch.float64)
+                    mix_var = torch.zeros(newX.shape[0], device=ogp_dev, dtype=torch.float64)
+                    Z = 0.0
+                    for e in bocpd.experts:
+                        w_e = math.exp(e.log_mass)
+                        e_Xh = e.X_hist if e.X_hist.numel() > 0 else None
+                        e_yh = e.y_hist if e.y_hist.numel() > 0 else None
+                        mu_e, var_e = e.pf.predict_batch(
+                            newX, e_Xh, e_yh,
+                            emulator_nn_std, model_cfg.rho, model_cfg.sigma_eps,
+                        )
+                        mix_mu += w_e * mu_e
+                        mix_var += w_e * var_e
+                        Z += w_e
+                    mix_mu /= max(Z, 1e-12)
+                    mix_var /= max(Z, 1e-12)
+                    mu_raw = gt.y_s_to_raw(mix_mu.cpu().numpy())
+                    rmse = float(np.sqrt(np.mean((mu_raw - np.asarray(yb))**2)))
+                    rmse_hist.append(rmse)
+                idx += 1
 
-            idx += 1
+                rec = bocpd.update_batch(
+                    newX, newY, emulator_nn_std, model_cfg, None, prior_sampler,
+                    verbose=False,
+                )
 
-            # update PF
-            rec = calib.step_batch(newX, newY, verbose=False)
+                dll = rec.get("delta_ll_pair", None)
+                if dll is not None and np.isfinite(dll):
+                    roll.update(dll)
 
-            # theta posterior (theta_s) -> raw minutes for logging
-            mean_theta_s, var_theta_s, lo_s, hi_s = calib._aggregate_particles(0.9)
-            mean_theta_raw = gt.theta_s_to_raw(mean_theta_s.item())
-            var_theta_raw = var_theta_s * (gt.theta_sd ** 2)
+                mean_theta_s, var_theta_s, lo_s, hi_s = _aggregate_ogp_particles(
+                    bocpd, 0.9,
+                )
+                mean_theta_raw = gt.theta_s_to_raw(float(mean_theta_s[0]))
+                var_theta_raw = float(var_theta_s[0]) * (gt.theta_sd ** 2)
+                gt_theta_hist.append(float(np.mean(thb)))
+                # print(mean_theta_raw, var_theta_raw)
+                theta_hist.append(mean_theta_raw)
+                theta_var_hist.append(var_theta_raw)
+                restart_hist.append(rec["did_restart"])
 
-            gt_theta_hist.append(float(np.mean(thb)))      # raw minutes
-            theta_hist.append(mean_theta_raw.item())       # raw minutes
-            # print(np.mean(thb), mean_theta_raw)
-            theta_var_hist.append(float(var_theta_raw))    # raw^2
-            restart_hist.append(rec["did_restart"])
+        # ---------- Standalone PF-OGP (no BOCPD) ----------
+        elif name == "PF-OGP":
+            ogp_dev = "cuda"
+            emulator_nn_std = PlantEmulatorNNStdTorch(nn_std, gt, device=ogp_dev)
+            pf_grad_func = make_fast_batched_grad_func(
+                emulator_nn_std.sim_func, device=ogp_dev, dtype=torch.float64,
+            )
+            x_domain = emulator_nn_std.x_domain_from_scaler(dx=5)
+            a_s = (3.0 - gt.theta_mu) / gt.theta_sd
+            b_s = (21.0 - gt.theta_mu) / gt.theta_sd
+            pf_ogp_cfg = OGPPFConfig(
+                num_particles=1024,
+                x_domain=x_domain,
+                theta_lo=torch.tensor([a_s]),
+                theta_hi=torch.tensor([b_s]),
+                theta_move_std=0.5 / gt.theta_sd,
+                ogp_quad_n=3,
+                particle_chunk_size=64,
+                max_hist=200,
+            )
+            pf_model_cfg = ModelConfig(rho=1.0, sigma_eps=gt.y_scaler.scale_[0])
+
+            pf = OGPParticleFilter(
+                ogp_cfg=pf_ogp_cfg,
+                prior_sampler=prior_sampler,
+                batched_grad_func=pf_grad_func,
+                device=ogp_dev,
+                dtype=torch.float64,
+            )
+
+            pf_X_hist = torch.empty(0, 5, dtype=torch.float64, device=ogp_dev)
+            pf_y_hist = torch.empty(0, dtype=torch.float64, device=ogp_dev)
+            pf_ogp_max_hist = 200
+
+            for Xb, yb, thb in tqdm(batches(stream, batch_size), desc=f"Running {name}"):
+                newX = batch_X_base_to_s(gt, Xb).to(device=ogp_dev)
+                newY = batch_y_to_s(gt, yb).to(device=ogp_dev)
+                gt_theta = torch.tensor(thb)
+
+                if idx > 0:
+                    pf_Xh = pf_X_hist if pf_X_hist.numel() > 0 else None
+                    pf_yh = pf_y_hist if pf_y_hist.numel() > 0 else None
+                    mu_mix, var_mix = pf.predict_batch(
+                        newX, pf_Xh, pf_yh,
+                        emulator_nn_std, pf_model_cfg.rho, pf_model_cfg.sigma_eps,
+                    )
+                    mu_raw = gt.y_s_to_raw(mu_mix.cpu().numpy())
+                    rmse = float(np.sqrt(np.mean((mu_raw - np.asarray(yb))**2)))
+                    rmse_hist.append(rmse)
+                idx += 1
+
+                pf.step_batch(
+                    newX, newY,
+                    pf_X_hist if pf_X_hist.numel() > 0 else None,
+                    pf_y_hist if pf_y_hist.numel() > 0 else None,
+                    emulator_nn_std,
+                    pf_model_cfg.rho,
+                    pf_model_cfg.sigma_eps,
+                )
+
+                if pf_X_hist.numel() == 0:
+                    pf_X_hist = newX.clone()
+                    pf_y_hist = newY.clone()
+                else:
+                    pf_X_hist = torch.cat([pf_X_hist, newX], dim=0)
+                    pf_y_hist = torch.cat([pf_y_hist, newY], dim=0)
+                if pf_X_hist.shape[0] > pf_ogp_max_hist:
+                    pf_X_hist = pf_X_hist[-pf_ogp_max_hist:]
+                    pf_y_hist = pf_y_hist[-pf_ogp_max_hist:]
+
+                w = pf.weights().view(-1, 1)
+                mean_theta_s = (w * pf.theta).sum(dim=0)
+                mean_theta_raw = gt.theta_s_to_raw(float(mean_theta_s[0]))
+                var_theta_raw = float(
+                    (w * (pf.theta - mean_theta_s).pow(2)).sum(dim=0)[0]
+                ) * (gt.theta_sd ** 2)
+                gt_theta_hist.append(float(np.mean(thb)))
+                theta_hist.append(mean_theta_raw)
+                theta_var_hist.append(var_theta_raw)
+                restart_hist.append(False)
+
+        # ---------- Existing BOCPD ----------
+        else:
+            cfg = CalibrationConfig()
+            cfg.bocpd.bocpd_mode = meta["mode"]
+            cfg.bocpd.use_restart = True
+
+            if meta["mode"] == "restart":
+                cfg.model.use_discrepancy = meta["use_discrepancy"]
+
+            calib = OnlineBayesCalibrator(cfg, emulator, prior_sampler)
+            for Xb, yb, thb in tqdm(batches(stream, batch_size), desc=f"Running {name}"):
+                newX = batch_X_base_to_s(gt, Xb)    # (B,5) standardized; DO NOT include thb
+                newY = batch_y_to_s(gt, yb)         # (B,) standardized
+
+                if idx > 0:
+                    pred = calib.predict_batch(newX)           # pred["mu"] is y_s
+                    pred_comp = calib.predict_complete(newX, newY)
+                    mu_s = pred["mu"].detach().cpu().numpy()
+                    mu_raw = gt.y_s_to_raw(mu_s)
+                    rmse = float(np.sqrt(np.mean((mu_raw - np.asarray(yb))**2)))
+                    rmse_hist.append(rmse)
+                    report_sub_hist = (pred_comp["crps_sim"].item(),pred_comp["experts_logpred"],pred_comp["var_sim"])
+                    comp_rmse_hist.append(report_sub_hist)
+
+                idx += 1
+
+                rec = calib.step_batch(newX, newY, verbose=False)
+
+                mean_theta_s, var_theta_s, lo_s, hi_s = calib._aggregate_particles(0.9)
+                mean_theta_raw = gt.theta_s_to_raw(mean_theta_s.item())
+                var_theta_raw = var_theta_s * (gt.theta_sd ** 2)
+
+                gt_theta_hist.append(float(np.mean(thb)))      # raw minutes
+                theta_hist.append(mean_theta_raw.item())       # raw minutes
+                theta_var_hist.append(float(var_theta_raw))    # raw^2
+                restart_hist.append(rec["did_restart"])
 
             
             # newX = torch.tensor(Xb)
@@ -487,9 +740,11 @@ if __name__ == "__main__":
     methods = {
         # "BPC-80": dict(type="bpc"),
         # "BOCPD-BPC": dict(type="bpc_bocpd"),
-        "BOCPD-PF": dict(type="bocpd", mode="standard"),
-        "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
-        "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False),
+        "R-BOCPD-PF-OGP": dict(type="ogp_bocpd"),
+        "PF-OGP": dict(type="pf_ogp"),
+        # "BOCPD-PF": dict(type="bocpd", mode="standard"),
+        # "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
+        # "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False),
         # "BPC-80": dict(type="bpc"),
     }
     all_results = {}

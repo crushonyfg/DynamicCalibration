@@ -3,6 +3,7 @@
 # Sudden-change (3 changepoints) magnitude/frequency grid experiment
 # =============================================================
 
+import math
 import os
 import numpy as np
 import torch
@@ -14,12 +15,17 @@ import itertools
 # -------------------------------------------------------------
 # Your existing modules (keep same as before)
 # -------------------------------------------------------------
-from .configs import CalibrationConfig
+from .configs import CalibrationConfig, BOCPDConfig, ModelConfig
 from .emulator import DeterministicSimulator
 from .online_calibrator import OnlineBayesCalibrator, crps_gaussian
 from .bpc import BayesianProjectedCalibration
 from .bpc_bocpd import *  # StandardBOCPD_BPC
 from .restart_bocpd_debug_260115_gpytorch import RollingStats
+from .restart_bocpd_ogp_gpytorch import (
+    BOCPD_OGP, OGPPFConfig, OGPParticleFilter,
+    RollingStats as OGPRollingStats,
+    make_fast_batched_grad_func,
+)
 
 
 # -------------------------------------------------------------
@@ -140,6 +146,54 @@ def oracle_theta(phi: np.ndarray, grid: np.ndarray) -> float:
 
 
 # -------------------------------------------------------------
+# Aggregate OGP-BOCPD particles across experts (mass-weighted)
+# -------------------------------------------------------------
+def _aggregate_ogp_particles(bocpd, quantile=0.9):
+    experts = bocpd.experts
+    if len(experts) == 0:
+        return None, None, None, None
+
+    d = experts[0].pf.theta.shape[1]
+    device = experts[0].pf.theta.device
+    dtype = experts[0].pf.theta.dtype
+
+    mean = torch.zeros(d, dtype=dtype, device=device)
+    cov = torch.zeros(d, d, dtype=dtype, device=device)
+    theta_list, weight_list = [], []
+
+    for e in experts:
+        w_e = math.exp(e.log_mass)
+        w = e.pf.weights()
+        th = e.pf.theta
+        m = (w[:, None] * th).sum(0)
+        C = ((th - m) * w[:, None]).T @ (th - m)
+        mean = mean + w_e * m
+        cov = cov + w_e * (C + (m - mean)[:, None] @ (m - mean)[None, :])
+        theta_list.append(th)
+        weight_list.append(w_e * w)
+
+    theta_all = torch.cat(theta_list, dim=0)
+    weight_all = torch.cat(weight_list, dim=0)
+    weight_all = weight_all / weight_all.sum()
+    var = torch.diag(cov)
+
+    def weighted_quantile_1d(x, w, q):
+        idx = torch.argsort(x)
+        x, w = x[idx], w[idx]
+        cw = torch.cumsum(w, dim=0)
+        return x[cw >= q][0]
+
+    alpha = (1.0 - quantile) / 2.0
+    lo = torch.zeros(d, dtype=dtype, device=device)
+    hi = torch.zeros(d, dtype=dtype, device=device)
+    for j in range(d):
+        lo[j] = weighted_quantile_1d(theta_all[:, j], weight_all, alpha)
+        hi[j] = weighted_quantile_1d(theta_all[:, j], weight_all, 1.0 - alpha)
+
+    return mean, var, lo, hi
+
+
+# -------------------------------------------------------------
 # Build 4 segment-phis (3 changepoints), centered around phi2=7.5
 # magnitude controls how far we move phi[1] (the "a2" term)
 # -------------------------------------------------------------
@@ -235,8 +289,197 @@ def run_one_sudden(
             seed=seed,
         )
 
+        # ---------- R-BOCPD-OGP ----------
+        if name == "R-BOCPD-PF-OGP":
+            emulator = DeterministicSimulator(
+                func=computer_model_config2_torch,
+                enable_autograd=True,
+            )
+            grad_func = make_fast_batched_grad_func(
+                computer_model_config2_torch, device="cuda", dtype=torch.float64,
+            )
+            ogp_cfg = OGPPFConfig(
+                num_particles=1024,
+                x_domain=(0.0, 1.0),
+                theta_lo=torch.tensor([0.0]),
+                theta_hi=torch.tensor([3.0]),
+                particle_chunk_size=256,
+            )
+            bocpd_cfg = BOCPDConfig()
+            bocpd_cfg.use_restart = True
+            model_cfg = ModelConfig(rho=1.0, sigma_eps=0.05)
+            roll = OGPRollingStats(window=50)
+
+            bocpd = BOCPD_OGP(
+                config=bocpd_cfg,
+                ogp_pf_cfg=ogp_cfg,
+                batched_grad_func=grad_func,
+                device="cuda",
+            )
+
+            from tqdm import tqdm
+            pbar = tqdm(total=total_T, desc=name, unit="obs")
+            while total_obs < total_T:
+                Xb, Yb = stream.next()
+                ogp_dev = bocpd.device
+                Xb64 = Xb.to(device=ogp_dev, dtype=torch.float64)
+                Yb64 = Yb.to(device=ogp_dev, dtype=torch.float64)
+
+                if total_obs > 0 and len(bocpd.experts) > 0:
+                    mix_mu = torch.zeros(bs, device=ogp_dev, dtype=torch.float64)
+                    mix_var = torch.zeros(bs, device=ogp_dev, dtype=torch.float64)
+                    Z = 0.0
+                    for e in bocpd.experts:
+                        w_e = math.exp(e.log_mass)
+                        e_X_hist = e.X_hist if e.X_hist.numel() > 0 else None
+                        e_y_hist = e.y_hist if e.y_hist.numel() > 0 else None
+                        mu_mix_e, var_mix_e = e.pf.predict_batch(
+                            Xb64, e_X_hist, e_y_hist,
+                            emulator, model_cfg.rho, model_cfg.sigma_eps,
+                        )
+                        mix_mu += w_e * mu_mix_e
+                        mix_var += w_e * var_mix_e
+                        Z += w_e
+                    mix_mu = mix_mu / max(Z, 1e-12)
+                    mix_var = mix_var / max(Z, 1e-12)
+                    rmse_hist.append(
+                        float(torch.sqrt(((mix_mu.cpu() - Yb64.cpu()) ** 2).mean()))
+                    )
+
+                rec = bocpd.update_batch(
+                    Xb64, Yb64, emulator, model_cfg, None, prior_sampler,
+                    verbose=False,
+                )
+
+                mean_theta, var_theta, lo_theta, hi_theta = _aggregate_ogp_particles(
+                    bocpd, 0.9,
+                )
+                theta_hist.append(float(mean_theta[0]))
+
+                batch_particles = []
+                batch_weights = []
+                batch_logmass = []
+                for e in bocpd.experts:
+                    batch_particles.append(e.pf.theta.squeeze(-1).detach().cpu())
+                    batch_weights.append(e.pf.weights().detach().cpu())
+                    batch_logmass.append(float(e.log_mass))
+
+                top0_particles_hist.append(dict(
+                    particles=batch_particles,
+                    weights=batch_weights,
+                    log_mass=torch.tensor(batch_logmass),
+                ))
+
+                others_hist.append(dict(
+                    did_restart=rec["did_restart"],
+                    var=float(var_theta[0]),
+                    lo=float(lo_theta[0]),
+                    hi=float(hi_theta[0]),
+                    seg_id=int(stream.seg_history[-1]),
+                    t=int(total_obs),
+                    pf_info=rec["pf_diags"],
+                ))
+
+                total_obs += bs
+                pbar.update(bs)
+            pbar.close()
+
+        # ---------- Standalone PF-OGP (no BOCPD) ----------
+        elif name == "PF-OGP":
+            emulator = DeterministicSimulator(
+                func=computer_model_config2_torch,
+                enable_autograd=True,
+            )
+            pf_grad_func = make_fast_batched_grad_func(
+                computer_model_config2_torch, device="cuda", dtype=torch.float64,
+            )
+            pf_ogp_cfg = OGPPFConfig(
+                num_particles=1024,
+                x_domain=(0.0, 1.0),
+                theta_lo=torch.tensor([0.0]),
+                theta_hi=torch.tensor([3.0]),
+                theta_move_std=0.02,
+                particle_chunk_size=256,
+            )
+            pf_model_cfg = ModelConfig(rho=1.0, sigma_eps=0.05)
+            ogp_dev = "cuda"
+
+            pf = OGPParticleFilter(
+                ogp_cfg=pf_ogp_cfg,
+                prior_sampler=prior_sampler,
+                batched_grad_func=pf_grad_func,
+                device=ogp_dev,
+                dtype=torch.float64,
+            )
+
+            pf_X_hist = torch.empty(
+                0, 1, dtype=torch.float64, device=ogp_dev,
+            )
+            pf_y_hist = torch.empty(0, dtype=torch.float64, device=ogp_dev)
+            pf_ogp_max_hist = 200
+
+            from tqdm import tqdm
+            pbar = tqdm(total=total_T, desc=name, unit="obs")
+            while total_obs < total_T:
+                Xb, Yb = stream.next()
+                Xb64 = Xb.to(device=ogp_dev, dtype=torch.float64)
+                Yb64 = Yb.to(device=ogp_dev, dtype=torch.float64)
+
+                if total_obs > 0:
+                    pf_Xh = pf_X_hist if pf_X_hist.numel() > 0 else None
+                    pf_yh = pf_y_hist if pf_y_hist.numel() > 0 else None
+                    mu_mix, var_mix = pf.predict_batch(
+                        Xb64, pf_Xh, pf_yh,
+                        emulator, pf_model_cfg.rho, pf_model_cfg.sigma_eps,
+                    )
+                    rmse_hist.append(
+                        float(torch.sqrt(((mu_mix.cpu() - Yb64.cpu()) ** 2).mean()))
+                    )
+
+                pf.step_batch(
+                    Xb64, Yb64,
+                    pf_X_hist if pf_X_hist.numel() > 0 else None,
+                    pf_y_hist if pf_y_hist.numel() > 0 else None,
+                    emulator,
+                    pf_model_cfg.rho,
+                    pf_model_cfg.sigma_eps,
+                )
+
+                if pf_X_hist.numel() == 0:
+                    pf_X_hist = Xb64.clone()
+                    pf_y_hist = Yb64.clone()
+                else:
+                    pf_X_hist = torch.cat([pf_X_hist, Xb64], dim=0)
+                    pf_y_hist = torch.cat([pf_y_hist, Yb64], dim=0)
+                if pf_X_hist.shape[0] > pf_ogp_max_hist:
+                    pf_X_hist = pf_X_hist[-pf_ogp_max_hist:]
+                    pf_y_hist = pf_y_hist[-pf_ogp_max_hist:]
+
+                w = pf.weights().view(-1, 1)
+                mean_theta = (w * pf.theta).sum(dim=0)
+                theta_hist.append(float(mean_theta[0]))
+
+                top0_particles_hist.append(dict(
+                    particles=[pf.theta.squeeze(-1).detach().cpu()],
+                    weights=[pf.weights().detach().cpu()],
+                    log_mass=torch.tensor([0.0]),
+                ))
+
+                others_hist.append(dict(
+                    did_restart=False,
+                    var=float(
+                        (w * (pf.theta - mean_theta).pow(2)).sum(dim=0)[0]
+                    ),
+                    seg_id=int(stream.seg_history[-1]),
+                    t=int(total_obs),
+                ))
+
+                total_obs += bs
+                pbar.update(bs)
+            pbar.close()
+
         # ---------- BOCPD ----------
-        if meta["type"] == "bocpd":
+        elif meta["type"] == "bocpd":
             cfg = CalibrationConfig()
             cfg.bocpd.bocpd_mode = meta["mode"]
             cfg.bocpd.use_restart = True
@@ -280,7 +523,7 @@ def run_one_sudden(
                 sig_hat = roll.std()
                 h_log = rec.get("h_log", None)
                 log_odds = rec.get("log_odds_mass", None)
-                print("debug: dll, mu_hat, sig_hat, h_log, log_odds",dll, mu_hat, sig_hat, h_log, log_odds)
+                # print("debug: dll, mu_hat, sig_hat, h_log, log_odds",dll, mu_hat, sig_hat, h_log, log_odds)
 
                 # NOTE: assumes your OnlineBayesCalibrator._aggregate_particles(q)
                 # returns (mean, var_or_cov, lo, hi) where mean/lo/hi are vectors.
@@ -585,31 +828,31 @@ def main():
     if args.debug:
         seeds = [456]               # you can add more
         batch_sizes = [20]      # you can add more
-        seg_lens = [200]
+        seg_lens = [120]
         magnitudes = [2.0] 
     else:
         magnitudes = [0.5, 1.0, 2.0, 3.0, 5.0]
-        seeds = [456]               # you can add more
-        batch_sizes = [20, 40]      # you can add more
+        seeds = [101, 202, 303, 404, 505]               # you can add more
+        batch_sizes = [20]      # you can add more
 
         # frequency: segment length L in observation-time units
         # NOTE: must be divisible by batch_size (enforced in run_one_sudden)
         seg_lens = [80, 120, 200]  # frequency: smaller => more frequent CPs
 
-        # magnitude: delta applied to phi[1] around center=7.5
-        magnitudes = [0.5, 1.0, 2.0, 3.0, 5.0]
-
     # methods
     methods = {
-        # "BOCPD-PF": dict(type="bocpd", mode="standard"),
+        "BOCPD-PF": dict(type="bocpd", mode="standard"),
         # "BPC-80": dict(type="bpc"),
         # "BOCPD-BPC": dict(type="bpc_bocpd"),
+        "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
+        "PF-OGP": dict(type="pf_ogp"),
         "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
-        "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False),
+        "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
         # "BPC-80": dict(type="bpc"),
     }
 
     # run grid
+    all_results = {}
     for seg_len_L, delta_mag, batch_size, seed in itertools.product(seg_lens, magnitudes, batch_sizes, seeds):
         # skip invalid combos early (L must be divisible by batch_size)
         if seg_len_L % batch_size != 0:
@@ -625,6 +868,7 @@ def main():
             phi_center=7.5,
             out_dir=out_dir,
         )
+        all_results[(seg_len_L, delta_mag, batch_size, seed)] = res
 
         tag = f"L{seg_len_L}_delta{delta_mag:g}_bs{batch_size}_seed{seed}"
         save_pt = os.path.join(out_dir, f"sudden_{tag}_results.pt")
@@ -649,6 +893,58 @@ def main():
         print(f"[Saved] {save_pt}")
         print(f"[Saved] {save_meta_pt}")
         print(f"[Saved] {save_png}")
+
+    all_metrics = []
+
+    for seg_len_L, delta_mag, batch_size, seed in itertools.product(seg_lens, magnitudes, batch_sizes, seeds):
+        # 从 all_results 获取对应的 res
+        res = all_results[(seg_len_L, delta_mag, batch_size, seed)]  # 注意：当前代码中 all_results[s] 会被覆盖，需要改为 all_results[(s, batch_size, seed)]
+        
+        for method_name, data in res.items():
+            # 计算 theta_rmse: sqrt(mean((theta_pred - theta_oracle)^2))
+            theta_rmse = np.sqrt(np.mean((data["theta"] - data["theta_oracle"]) ** 2))
+            
+            # y_rmse 已经存在于 data["rmse"] 中
+            y_rmse_mean = np.mean(data["rmse"])
+            
+            # y_crps 已经存在于 data["crps_hist"] 中
+            y_crps_mean = np.mean(data["crps_hist"])
+            
+            all_metrics.append({
+                "method": method_name,
+                "slope": s,
+                "batch_size": batch_size,
+                "seed": seed,
+                "theta_rmse": theta_rmse,
+                "y_rmse": y_rmse_mean,
+                "y_crps": y_crps_mean,
+            })
+
+    # 转换为 DataFrame 并保存
+    import pandas as pd
+    df_metrics = pd.DataFrame(all_metrics)
+    df_metrics.to_csv(f"{store_dir}/all_metrics.csv", index=False)
+    df_metrics.to_excel(f"{store_dir}/all_metrics.xlsx", index=False)
+
+    # ========== 打印每个 method 的平均 metrics ==========
+    print("\n" + "="*70)
+    print("Average Metrics Across All Combinations (seg_len_L × delta_mag × batch_sizes × seeds):")
+    print("="*70)
+
+    grouped = df_metrics.groupby("method").agg({
+        "theta_rmse": ["mean", "std"],
+        "y_rmse": ["mean", "std"],
+        "y_crps": ["mean", "std"],
+    })
+
+    for method in df_metrics["method"].unique():
+        print(f"\n{method}:")
+        stats = grouped.loc[method]
+        print(f"  theta_rmse: {stats[('theta_rmse', 'mean')]:.6f} ± {stats[('theta_rmse', 'std')]:.6f}")
+        print(f"  y_rmse:     {stats[('y_rmse', 'mean')]:.6f} ± {stats[('y_rmse', 'std')]:.6f}")
+        print(f"  y_crps:     {stats[('y_crps', 'mean')]:.6f} ± {stats[('y_crps', 'std')]:.6f}")
+
+    print("\n" + "="*70)
 
     print("All sudden-change grid experiments finished.")
 

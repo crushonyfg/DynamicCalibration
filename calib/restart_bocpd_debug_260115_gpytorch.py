@@ -210,18 +210,32 @@ class BOCPD:
         out: List[float] = []
         for e in self.experts:
             ps: ParticleSet = e.pf.particles
-            info = loglik_and_grads(
-                Y_batch,
-                X_batch,
-                ps,
-                emulator,
-                e.delta_state,
-                model_cfg.rho,
-                model_cfg.sigma_eps,
-                need_grads=False,
-                # use_discrepancy=model_cfg.use_discrepancy,
-                use_discrepancy=model_cfg.bocpd_use_discrepancy,
-            )
+            try:
+                info = loglik_and_grads(
+                    Y_batch,
+                    X_batch,
+                    ps,
+                    emulator,
+                    e.delta_state,
+                    model_cfg.rho,
+                    model_cfg.sigma_eps,
+                    need_grads=False,
+                    # use_discrepancy=model_cfg.use_discrepancy,
+                    use_discrepancy=model_cfg.bocpd_use_discrepancy,
+                )
+            except:
+                info = loglik_and_grads(
+                    Y_batch,
+                    X_batch,
+                    ps,
+                    emulator,
+                    e.delta_state,
+                    model_cfg.rho,
+                    model_cfg.sigma_eps,
+                    need_grads=False,
+                    use_discrepancy=model_cfg.use_discrepancy,
+                    # use_discrepancy=model_cfg.bocpd_use_discrepancy,
+                )
             # info["loglik"]: [batch_size, N]
             loglik = torch.clamp(info["loglik"], min=-1e10, max=1e10)
             logmix_per_t = torch.logsumexp(ps.logw.view(1, -1) + loglik, dim=1)  # [batch_size]
