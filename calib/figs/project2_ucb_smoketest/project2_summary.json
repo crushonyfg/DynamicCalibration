@@ -1,0 +1,20 @@
+{
+  "backend": "emulator",
+  "baseline_x_decision_order_q_r_w_m1_m2": [
+    93,
+    85,
+    12,
+    3,
+    3
+  ],
+  "num_batches": 3,
+  "batch_size": 4,
+  "hold_batches": 1,
+  "beta": 1.5,
+  "num_particles": 64,
+  "cum_gap_mean_final": -12811.28125,
+  "cum_gap_best_final": 31068.5625,
+  "avg_reality_gap_mean": -317.788371594972,
+  "avg_reality_gap_best": 8517.706455211272,
+  "restart_count": 0
+}

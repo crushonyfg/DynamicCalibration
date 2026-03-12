@@ -1,0 +1,61 @@
+{
+  "backend": "plantsim",
+  "baseline_top_q_r_w_m1_m2": [
+    [
+      64,
+      90,
+      11,
+      3,
+      2
+    ],
+    [
+      57,
+      91,
+      11,
+      3,
+      2
+    ],
+    [
+      59,
+      93,
+      11,
+      3,
+      2
+    ],
+    [
+      56,
+      94,
+      10,
+      3,
+      2
+    ],
+    [
+      52,
+      91,
+      10,
+      3,
+      2
+    ]
+  ],
+  "num_batches": 80,
+  "candidate_top_k": 5,
+  "baseline_top_k": 5,
+  "calibration_points_per_batch": 10,
+  "hold_batches": 3,
+  "theta_schedule_mode": "platform",
+  "platform_levels": "3,11.5,20,30",
+  "platform_block_batches": 20,
+  "platform_noise_std": 0.8,
+  "jump_batch": null,
+  "jump_target_theta": null,
+  "beta": 0.3,
+  "num_particles": 512,
+  "cum_gap_mean_final": 9251549.600000001,
+  "cum_gap_best_final": 8326897.0,
+  "avg_theta_abs_error": 1.3078029039827357,
+  "avg_reality_gap_mean": -45827.57450209862,
+  "avg_reality_gap_best": -42831.38308202984,
+  "avg_candidate_max_minus_baseline_max": 104086.2125,
+  "final_candidate_max_minus_baseline_max": -2411.0,
+  "restart_count": 3
+}

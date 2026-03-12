@@ -1,0 +1,302 @@
+\documentclass[aspectratio=169,11pt]{beamer}
+
+\usetheme{Madrid}
+\usecolortheme{default}
+\setbeamertemplate{navigation symbols}{}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{pgfplots}
+\usepackage{pgfplotstable}
+\usepackage{siunitx}
+\usepackage{hyperref}
+
+\pgfplotsset{compat=1.18}
+\sisetup{group-separator={,}, round-mode=places, round-precision=2}
+
+\newcommand{\CourseName}{Course Name Placeholder}
+\newcommand{\InstructorName}{Instructor Placeholder}
+\newcommand{\StudentName}{Student Name Placeholder}
+\newcommand{\StudentID}{Student ID Placeholder}
+
+\title[Digital Twin SimOpt]{Project 2: Digital Twin-Enabled Simulation-Based Optimization}
+\subtitle{Continuous Calibration and Simulation-Based Decision Selection in Plant Simulation}
+\author{\StudentName \\ \small \StudentID}
+\institute{\CourseName \\ \small Instructor: \InstructorName}
+\date{\today}
+
+\begin{document}
+
+\begin{frame}
+    \titlepage
+\end{frame}
+
+\begin{frame}{Presentation Roadmap}
+    \tableofcontents
+\end{frame}
+
+\section{Problem}
+
+\begin{frame}{Problem Definition}
+    \textbf{Goal:} use the synchronized digital twin from Project 1 to optimize decisions online instead of only monitoring the system.
+
+    \vspace{0.4cm}
+    \textbf{Objective}
+    \[
+    \max_X \; J_t(X;\theta_t)=\mathbb{E}[\text{NetRevenue}\mid X,\theta_t]
+    \]
+
+    \textbf{Decision variables}
+    \[
+    X=(Q,R,W,M1,M2)
+    \]
+    with
+    \[
+    Q,R \in \{50,\dots,100\},\;
+    W \in \{10,\dots,15\},\;
+    M1,M2 \in \{1,2,3\}
+    \]
+
+    \textbf{Key idea}
+    \begin{itemize}
+        \item Project 1 estimates the latent arrival parameter $\theta$ online.
+        \item Project 2 uses that synchronized state to select high-revenue decisions.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Bridge from Project 1 to Project 2}
+    \textbf{Project 1 output:} online posterior over the customer-arrival parameter $\theta$.
+
+    \vspace{0.4cm}
+    \textbf{Project 2 loop}
+    \begin{enumerate}
+        \item observe new \((X,y)\) data from the physical/proxy system,
+        \item recalibrate the digital twin online,
+        \item use the synchronized twin to score candidate decisions,
+        \item deploy new candidates and validate them on the physical system.
+    \end{enumerate}
+
+    \vspace{0.4cm}
+    \textbf{Why this matters}
+    \begin{itemize}
+        \item a static nominal policy may become suboptimal when $\theta$ changes,
+        \item a synchronized twin can adapt optimization decisions to changing conditions.
+    \end{itemize}
+\end{frame}
+
+\section{Method}
+
+\begin{frame}{Method Overview}
+    \textbf{Digital twin components}
+    \begin{itemize}
+        \item offline neural emulator trained on aggregated Plant Simulation data,
+        \item online restart BOCPD + particle filter for continuous calibration.
+    \end{itemize}
+
+    \vspace{0.3cm}
+    \textbf{Selection policy}
+    \[
+    \text{score}(X)=\mu(X)+\beta\sigma(X), \qquad \beta=0.3
+    \]
+    where $\mu(X)$ and $\sigma(X)$ come from the synchronized twin.
+
+    \vspace{0.3cm}
+    \textbf{Per batch}
+    \begin{itemize}
+        \item select top-5 candidate points,
+        \item compare with fixed baseline top-5 from $\theta=11.5$,
+        \item evaluate 10 points in Plant Simulation,
+        \item feed all 10 observations back into calibration.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Experimental Design}
+    \textbf{Nonstationary environment}
+    \begin{itemize}
+        \item true $\theta$ switches among 4 platforms:
+        \[
+        \{3,\;11.5,\;20,\;30\}
+        \]
+        \item each platform lasts 20 batches,
+        \item within each platform:
+        \[
+        \theta_t \sim \mathcal{N}(\theta_{\text{platform}}, 0.8^2), \quad \theta_t > 0
+        \]
+    \end{itemize}
+
+    \vspace{0.3cm}
+    \textbf{Why this schedule?}
+    \begin{itemize}
+        \item platform jumps create clearer regime changes than a smooth sinusoidal drift,
+        \item easier to test whether synchronization improves decision quality.
+    \end{itemize}
+
+    \vspace{0.3cm}
+    \textbf{Run configuration}
+    \begin{itemize}
+        \item 80 batches,
+        \item 512 particles,
+        \item 5 candidate points + 5 baseline points per batch,
+        \item backend: Plant Simulation.
+    \end{itemize}
+\end{frame}
+
+\section{Results}
+
+\begin{frame}{Theta Tracking}
+    \begin{center}
+    \begin{tikzpicture}
+    \begin{axis}[
+        width=0.95\textwidth,
+        height=0.58\textheight,
+        xlabel={Batch index},
+        ylabel={$\theta$ (minutes)},
+        grid=both,
+        legend style={at={(0.5,1.02)}, anchor=south, legend columns=2},
+    ]
+    \addplot[blue, thick] table[x=batch_idx, y=theta_true, col sep=comma] {project2_batch_summary.csv};
+    \addlegendentry{True $\theta$}
+    \addplot[red, thick] table[x=batch_idx, y=theta_est, col sep=comma] {project2_batch_summary.csv};
+    \addlegendentry{Estimated $\theta$}
+    \end{axis}
+    \end{tikzpicture}
+    \end{center}
+
+    \textbf{Takeaway:}
+    the calibrator tracks the platform changes reasonably well, but visible lag appears after major jumps.
+\end{frame}
+
+\begin{frame}{Main Quantitative Results}
+    \begin{table}
+    \centering
+    \begin{tabular}{p{0.62\linewidth}r}
+    \toprule
+    Metric & Value \\
+    \midrule
+    Final cumulative mean improvement over baseline & 9,251,549.6 \\
+    Final cumulative max improvement over baseline & 8,326,897.0 \\
+    Average absolute theta tracking error & 1.31 \\
+    Median absolute theta tracking error & 0.96 \\
+    Restart count & 3 \\
+    Candidate mean better than baseline mean & 27 / 80 \\
+    Candidate max better than baseline max & 19 / 80 \\
+    \bottomrule
+    \end{tabular}
+    \end{table}
+
+    \textbf{Interpretation}
+    \begin{itemize}
+        \item the synchronized policy wins in cumulative performance,
+        \item but it does not dominate the baseline in every single batch,
+        \item synchronization helps most over the full horizon rather than instantaneously.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Optimization Progress}
+    \begin{center}
+    \begin{tikzpicture}
+    \begin{axis}[
+        width=0.95\textwidth,
+        height=0.58\textheight,
+        xlabel={Batch index},
+        ylabel={Cumulative gap},
+        grid=both,
+        legend style={at={(0.5,1.02)}, anchor=south, legend columns=2},
+    ]
+    \addplot[teal, thick] table[x=batch_idx, y=cum_gap_mean, col sep=comma] {project2_batch_summary.csv};
+    \addlegendentry{Candidate mean - baseline mean}
+    \addplot[orange, thick] table[x=batch_idx, y=cum_gap_best, col sep=comma] {project2_batch_summary.csv};
+    \addlegendentry{Candidate max - baseline max}
+    \end{axis}
+    \end{tikzpicture}
+    \end{center}
+
+    \textbf{Takeaway:}
+    despite temporary losses after some jumps, the synchronized policy accumulates a strong positive advantage over time.
+\end{frame}
+
+\begin{frame}{Reality Gap and Validation}
+    \textbf{Validation step}
+    \begin{itemize}
+        \item decisions selected by the twin are directly evaluated in Plant Simulation,
+        \item this closes the loop between prediction and physical/proxy validation.
+    \end{itemize}
+
+    \vspace{0.4cm}
+    \textbf{Reality gap}
+    \[
+    \text{RealityGap}(X_t)=y_t^{\text{actual}}-y_t^{\text{pred}}
+    \]
+
+    \begin{itemize}
+        \item average reality gap (mean reward): \(-45{,}827.57\)
+        \item average reality gap (max reward): \(-42{,}831.38\)
+    \end{itemize}
+
+    \textbf{Interpretation}
+    \begin{itemize}
+        \item the twin is somewhat optimistic on selected points,
+        \item but cumulative gains remain positive even after physical validation.
+    \end{itemize}
+\end{frame}
+
+\section{Discussion}
+
+\begin{frame}{Discussion}
+    \textbf{What worked}
+    \begin{itemize}
+        \item the digital twin tracked regime switches with moderate error,
+        \item synchronization produced positive cumulative improvement over a nominal baseline,
+        \item the framework successfully closed the calibration--optimization--validation loop.
+    \end{itemize}
+
+    \vspace{0.3cm}
+    \textbf{Main limitations}
+    \begin{itemize}
+        \item candidate search is pool-based rather than globally optimal,
+        \item selected points still show an optimism-driven reality gap,
+        \item baseline remains competitive in many single batches.
+    \end{itemize}
+
+    \vspace{0.3cm}
+    \textbf{Practical implication}
+    \begin{itemize}
+        \item synchronization is most valuable in rolling-horizon planning under nonstationarity.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Conclusion}
+    \textbf{Conclusion}
+    \begin{itemize}
+        \item Project 1 provided a synchronized digital twin.
+        \item Project 2 used that synchronized twin as a decision-support engine.
+        \item Under platform-switching demand conditions, the proposed policy outperformed a fixed baseline in cumulative reward.
+    \end{itemize}
+
+    \vspace{0.4cm}
+    \textbf{Main message}
+    \begin{block}{}
+    A synchronized digital twin can support simulation-based optimization under changing operating conditions, not just monitoring.
+    \end{block}
+
+    \vspace{0.3cm}
+    \textbf{Future work}
+    \begin{itemize}
+        \item improve ranking accuracy of the twin,
+        \item compare posterior-UCB with direct $\theta_{\text{est}}$-conditioned exploitation,
+        \item refine candidate search over the full discrete space.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Thank You}
+    \centering
+    {\Large Thank you!}
+
+    \vspace{0.6cm}
+    Questions and discussion.
+\end{frame}
+
+\end{document}
