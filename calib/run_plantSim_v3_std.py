@@ -450,38 +450,69 @@ def batch_y_to_s(gt: GlobalTransformSep, yb: np.ndarray) -> torch.Tensor:
 
 
 # =========================
-# 7) MAIN: train + run PF loop
+# 7) Pipeline initialisation & helpers
 # =========================
-# 7.1 load aggregated computer data
-data = np.load(r"C:/Users/yxu59/files/winter2026/park/simulation/ComputerData_v3/factory_aggregated.npz", allow_pickle=True)
-X_base = data["X"]       # (N,5)
-y_raw  = data["y"]       # (N,)
-theta_raw = data["theta"]  # (N,) minutes
+_DEFAULT_NPZ = r"C:/Users/yxu59/files/winter2026/park/simulation/ComputerData_v3/factory_aggregated.npz"
 
-# train/test split
-X_tr, X_te, y_tr, y_te, th_tr, th_te = train_test_split(
-    X_base, y_raw, theta_raw, test_size=0.2, random_state=0, shuffle=True
-)
+# Module-level globals — populated by init_pipeline()
+gt  = None   # type: GlobalTransformSep
+nn_std = None   # type: NNModelTorchStd
+emu = None   # type: PlantEmulatorNNStd
+a_s = 0.0
+b_s = 0.0
 
-# fit transforms ONLY on train
-gt = GlobalTransformSep().fit(X_tr, th_tr, y_tr)
 
-# build standardized training set for NN: X_full_s = [X_base_s, theta_s]
-X_tr_s = gt.X_base_to_s(X_tr)                           # (N,5)
-th_tr_s = gt.theta_raw_to_s(th_tr).reshape(-1, 1)       # (N,1)
-X_full_tr_s = np.concatenate([X_tr_s, th_tr_s], axis=1) # (N,6)
-y_tr_s = gt.y_raw_to_s(y_tr)                            # (N,)
+def init_pipeline(
+    npz_path: str = None,
+    model_save_path: str = "nn_std.bundle.joblib",
+    epochs: int = 200,
+    force_retrain: bool = False,
+):
+    """Load computer-sim data, fit transforms, train / load NN emulator.
 
-# train NN in standardized space
-nn_std = NNModelTorchStd(input_dim=6).fit(X_full_tr_s, y_tr_s, epochs=200)
-nn_std.save("nn_std.bundle.joblib")
+    Sets module-level globals (gt, nn_std, emu, a_s, b_s).
+    Returns (gt, nn_std, emu, a_s, b_s) for convenience.
+    """
+    global gt, nn_std, emu, a_s, b_s
+    if gt is not None and not force_retrain:
+        return gt, nn_std, emu, a_s, b_s
 
-# build standardized-space emulator
-emu = PlantEmulatorNNStd(nn_std)
+    if npz_path is None:
+        npz_path = _DEFAULT_NPZ
 
-a_raw, b_raw = 3.0, 21.0
-a_s = (a_raw - gt.theta_mu) / gt.theta_sd
-b_s = (b_raw - gt.theta_mu) / gt.theta_sd
+    print(f"[init] Loading computer data from {npz_path}")
+    data = np.load(npz_path, allow_pickle=True)
+    X_base = data["X"]       # (N,5)
+    y_raw  = data["y"]       # (N,)
+    theta_raw = data["theta"]  # (N,) minutes
+
+    X_tr, X_te, y_tr, y_te, th_tr, th_te = train_test_split(
+        X_base, y_raw, theta_raw, test_size=0.2, random_state=0, shuffle=True
+    )
+
+    gt = GlobalTransformSep().fit(X_tr, th_tr, y_tr)
+
+    if os.path.exists(model_save_path) and not force_retrain:
+        print(f"[init] Loading pre-trained NN from {model_save_path}")
+        nn_std = NNModelTorchStd.load(model_save_path, hidden=(128, 64, 32))
+    else:
+        print(f"[init] Training NN emulator ({epochs} epochs) ...")
+        X_tr_s = gt.X_base_to_s(X_tr)
+        th_tr_s = gt.theta_raw_to_s(th_tr).reshape(-1, 1)
+        X_full_tr_s = np.concatenate([X_tr_s, th_tr_s], axis=1)
+        y_tr_s = gt.y_raw_to_s(y_tr)
+        nn_std = NNModelTorchStd(input_dim=6).fit(X_full_tr_s, y_tr_s, epochs=epochs)
+        nn_std.save(model_save_path)
+
+    emu = PlantEmulatorNNStd(nn_std)
+
+    a_raw, b_raw = 3.0, 21.0
+    a_s = (a_raw - gt.theta_mu) / gt.theta_sd
+    b_s = (b_raw - gt.theta_mu) / gt.theta_sd
+
+    print("[init] Pipeline ready.\n")
+    return gt, nn_std, emu, a_s, b_s
+
 
 def prior_sampler(N):
     return torch.rand(N, 1, dtype=torch.float64) * (b_s - a_s) + a_s   # theta_s
@@ -756,6 +787,9 @@ if __name__ == "__main__":
     
     out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
+
+    # Initialise NN pipeline (load data + train/load model)
+    init_pipeline()
     
     methods = {
         # "BPC-80": dict(type="bpc"),
