@@ -1,3 +1,17 @@
+"""
+run_plantSim_v3.py - Plant Simulation 校准实验
+
+用法:
+    # 方式1: 从目录读取Excel文件 (默认)
+    python -m calib.run_plantSim_v3 --data_dir "C:/Users/yxu59/files/winter2026/park/simulation/PhysicalData_v3"
+    
+    # 方式2: 从CSV文件读取
+    python -m calib.run_plantSim_v3 --csv "C:/Users/yxu59/files/autumn2025/park/DynamicCalibration/physical_data.csv"
+    
+    # 其他参数
+    python -m calib.run_plantSim_v3 --csv physical_data.csv --out_dir figs/plantSim/v3 --modes 0 1 2
+"""
+
 import math
 import numpy as np
 import torch
@@ -153,8 +167,9 @@ def batches(stream: StreamClass, batch_size: int):
         except StopIteration:
             break
 
-def run_plantSim(mode, methods, batch_size):
-    folder = "C:/Users/yxu59/files/winter2026/park/simulation/PhysicalData_v3"
+def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
+    if data_dir is None and csv_path is None:
+        data_dir = "C:/Users/yxu59/files/winter2026/park/simulation/PhysicalData_v3"
 
     emulator = PlantEmulatorNN()
 
@@ -176,9 +191,9 @@ def run_plantSim(mode, methods, batch_size):
                 min_jump_span=40,
                 seed=7
             )
-            stream = StreamClass(0, folder, jump_plan=jp)
+            stream = StreamClass(0, folder=data_dir, csv_path=csv_path, jump_plan=jp)
         else:
-            stream = StreamClass(mode, folder)
+            stream = StreamClass(mode, folder=data_dir, csv_path=csv_path)
 
         # ---------- R-BOCPD-PF-OGP ----------
         if name == "R-BOCPD-PF-OGP":
@@ -374,12 +389,17 @@ def run_plantSim(mode, methods, batch_size):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    # parser.add_argument("--debug", action="store_true", default=False)
-    parser.add_argument("--out_dir", type=str, default="figs/plantSim/v3")
+    parser = argparse.ArgumentParser(description="Plant Simulation Calibration Experiment")
+    parser.add_argument("--out_dir", type=str, default="figs/plantSim/v3", help="Output directory for figures")
+    parser.add_argument("--data_dir", type=str, default=None, help="Path to PhysicalData directory (Excel files)")
+    parser.add_argument("--csv", type=str, default=None, help="Path to aggregated CSV file")
+    parser.add_argument("--modes", type=int, nargs="+", default=[0, 1, 2], help="Modes to run (e.g., --modes 0 1 2)")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     args = parser.parse_args()
+    
     out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
+    
     methods = {
         # "BPC-80": dict(type="bpc"),
         # "BOCPD-BPC": dict(type="bpc_bocpd"),
@@ -391,10 +411,15 @@ if __name__ == "__main__":
         # "BPC-80": dict(type="bpc"),
     }
     all_results = {}
-    # for mode in [0, 1]:
-    for mode in [0,1,2]:
-        for bs in [4]:
-            results = run_plantSim(mode=mode, methods=methods, batch_size=bs)
+    for mode in args.modes:
+        for bs in [args.batch_size]:
+            results = run_plantSim(
+                mode=mode, 
+                methods=methods, 
+                batch_size=bs,
+                data_dir=args.data_dir,
+                csv_path=args.csv,
+            )
             all_results[f"mode{mode}_bs{bs}"] = results
 
             plt.figure(figsize=(10, 5))
@@ -408,6 +433,5 @@ if __name__ == "__main__":
             plt.tight_layout()
             plt.savefig(f"{out_dir}/mode{mode}_bs{bs}_theta.png", dpi=300)
             plt.close()
-    
 
     torch.save(all_results, f"{out_dir}/plantSim_results_mode{mode}.pt")

@@ -75,22 +75,29 @@ class JumpPlan:
 
 class StreamClass:
     """
-    stream = StreamClass(mode, folder)
+    stream = StreamClass(mode, folder)          # 从目录读取多个Excel文件
+    stream = StreamClass(mode, csv_path=path)   # 从单个CSV文件读取
     X, y, theta = stream.next(batch_size)
 
     mode=0: ordered by t
     mode=1: ordered stream with multiple jumps (forward/back), not too frequent,
             with theta-gap constraint based on lbd_from_t(t).
+    
+    CSV文件格式要求列: t, mode, W, R, M1, M2, Q, NetRevenue, CustomerLbd_min
     """
 
-    def __init__(self, mode: int, folder: str, jump_plan: Optional[JumpPlan] = None):
+    def __init__(self, mode: int, folder: str = None, csv_path: str = None, jump_plan: Optional[JumpPlan] = None):
         self.mode = int(mode)
         self.folder = folder
+        self.csv_path = csv_path
         self.jump_plan = jump_plan if jump_plan is not None else JumpPlan()
         self.rng = np.random.default_rng(self.jump_plan.seed) if self.jump_plan is not None else np.random.default_rng()
         self._use_jump = jump_plan is not None
+        
+        self._use_csv = csv_path is not None
+        self._csv_data = None
 
-        self._index = self._build_index()  # list of (t, filepath) sorted by t
+        self._index = self._build_index()  # list of (t, filepath_or_row_idx) sorted by t
         self._n = len(self._index)
 
         self._pos = 0            # current index position into _index
@@ -101,7 +108,42 @@ class StreamClass:
         # Track last emitted t for theta gap calculation
         self._last_t: Optional[int] = None
 
-    def _build_index(self) -> List[Tuple[int, str]]:
+    def _build_index(self) -> List[Tuple[int, any]]:
+        if self._use_csv:
+            return self._build_index_from_csv()
+        else:
+            return self._build_index_from_folder()
+    
+    def _build_index_from_csv(self) -> List[Tuple[int, int]]:
+        """从CSV文件构建索引，返回 (t, row_idx) 列表"""
+        if not os.path.exists(self.csv_path):
+            raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
+        
+        df = pd.read_csv(self.csv_path)
+        required = ["t", "mode", "W", "R", "M1", "M2", "Q", "NetRevenue", "CustomerLbd_min"]
+        miss = [c for c in required if c not in df.columns]
+        if miss:
+            raise ValueError(f"CSV missing columns: {miss}. Found: {list(df.columns)}")
+        
+        df_mode = df[df["mode"] == self.mode].reset_index(drop=True)
+        if len(df_mode) == 0:
+            raise ValueError(f"No data found for mode={self.mode} in CSV")
+        
+        self._csv_data = df_mode
+        
+        items: List[Tuple[int, int]] = []
+        for idx, row in df_mode.iterrows():
+            t = int(row["t"])
+            items.append((t, idx))
+        
+        items.sort(key=lambda x: x[0])
+        return items
+    
+    def _build_index_from_folder(self) -> List[Tuple[int, str]]:
+        """从目录构建索引，返回 (t, filepath) 列表"""
+        if self.folder is None:
+            raise ValueError("Either folder or csv_path must be provided")
+        
         pattern = os.path.join(self.folder, f"factory_Mode{self.mode}t*.xlsx")
         files = glob.glob(pattern)
         if not files:
@@ -184,12 +226,52 @@ class StreamClass:
             self._jumps_done += 1
             self._next_jump_at = self._draw_next_jump_at()
 
+    def _read_one_sample_csv(self, row_idx: int):
+        """从CSV读取单个样本"""
+        row = self._csv_data.iloc[row_idx]
+        W = int(row["W"])
+        R = int(row["R"])
+        M1 = int(row["M1"])
+        M2 = int(row["M2"])
+        Q = int(row["Q"])
+        y = float(row["NetRevenue"])
+        theta_min = float(row["CustomerLbd_min"])
+        theta_sec = theta_min * 60.0
+        return W, R, M1, M2, Q, y, theta_sec
+    
+    def _read_one_sample_excel(self, fp: str):
+        """从Excel读取单个样本"""
+        df = pd.read_excel(fp)
+        if df.shape[0] < 1:
+            return None
+
+        df.columns = [str(c).strip() for c in df.columns]
+        required = ["CustomerLbd", "NetRevenue", "W", "R", "M1", "M2", "Q"]
+        miss = [c for c in required if c not in df.columns]
+        if miss:
+            raise ValueError(f"Missing columns {miss} in {fp}. Found={list(df.columns)}")
+
+        r0 = df.iloc[0]
+        theta = parse_mmss_to_seconds(r0["CustomerLbd"])
+        y = float(pd.to_numeric(r0["NetRevenue"], errors="coerce"))
+
+        W  = int(pd.to_numeric(r0["W"],  errors="coerce"))
+        R  = int(pd.to_numeric(r0["R"],  errors="coerce"))
+        M1 = int(pd.to_numeric(r0["M1"], errors="coerce"))
+        M2 = int(pd.to_numeric(r0["M2"], errors="coerce"))
+        Q  = int(pd.to_numeric(r0["Q"],  errors="coerce"))
+
+        if np.isnan(theta) or np.isnan(y):
+            return None
+        
+        return W, R, M1, M2, Q, y, theta
+
     def next(self, batch_size: int):
         """
         Returns:
           X: (B,5) int64 [W,R,M1,M2,Q]
           y: (B,) float64 NetRevenue
-          theta: (B,) float64 CustomerLbd (SECONDS)
+          theta: (B,) float64 CustomerLbd (minutes)
         Raises StopIteration if no more data can be read.
         """
         B = int(batch_size)
@@ -204,37 +286,20 @@ class StreamClass:
             if self._pos >= self._n:
                 break
 
-            # jump is checked BETWEEN draws, so it can cut segments like:
-            # [0:200] [250:450] [180:320] ...
             self._maybe_jump()
 
-            t, fp = self._index[self._pos]
+            t, ref = self._index[self._pos]
             self._pos += 1
 
-            df = pd.read_excel(fp)
-            if df.shape[0] < 1:
+            if self._use_csv:
+                sample = self._read_one_sample_csv(ref)
+            else:
+                sample = self._read_one_sample_excel(ref)
+            
+            if sample is None:
                 continue
 
-            df.columns = [str(c).strip() for c in df.columns]
-            required = ["CustomerLbd", "NetRevenue", "W", "R", "M1", "M2", "Q"]
-            miss = [c for c in required if c not in df.columns]
-            if miss:
-                raise ValueError(f"Missing columns {miss} in {fp}. Found={list(df.columns)}")
-
-            r0 = df.iloc[0]
-            theta = parse_mmss_to_seconds(r0["CustomerLbd"])
-            y = float(pd.to_numeric(r0["NetRevenue"], errors="coerce"))
-
-            W  = int(pd.to_numeric(r0["W"],  errors="coerce"))
-            R  = int(pd.to_numeric(r0["R"],  errors="coerce"))
-            M1 = int(pd.to_numeric(r0["M1"], errors="coerce"))
-            M2 = int(pd.to_numeric(r0["M2"], errors="coerce"))
-            Q  = int(pd.to_numeric(r0["Q"],  errors="coerce"))
-
-            if np.isnan(theta) or np.isnan(y):
-                continue
-
-            rows.append((W, R, M1, M2, Q, y, theta))
+            rows.append(sample)
             self._emitted += 1
             self._last_t = t
 
