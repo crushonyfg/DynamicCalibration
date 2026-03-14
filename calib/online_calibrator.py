@@ -334,14 +334,24 @@ class OnlineBayesCalibrator:
 
         theta_all = torch.cat(theta_list, dim=0)
         weight_all = torch.cat(weight_list, dim=0)
-        weight_all = weight_all / weight_all.sum()
+        w_sum = weight_all.sum()
 
-        def weighted_quantile_1d(x,w,q):
+        # Handle degenerate weights (all zero / NaN) — fall back to uniform
+        if w_sum < 1e-30 or torch.isnan(w_sum):
+            weight_all = torch.ones_like(weight_all) / len(weight_all)
+        else:
+            weight_all = weight_all / w_sum
+
+        def weighted_quantile_1d(x, w, q):
             idx = torch.argsort(x)
             x = x[idx]
             w = w[idx]
             cw = torch.cumsum(w, dim=0)
-            return x[cw >= q][0]
+            mask = cw >= q
+            if mask.any():
+                return x[mask][0]
+            # Fallback: return last element (highest quantile available)
+            return x[-1]
 
         def particle_ci(theta_all, weight_all, level=0.9):
             alpha = (1.0 - level) / 2.0

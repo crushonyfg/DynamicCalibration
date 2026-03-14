@@ -504,6 +504,10 @@ class BOCPD:
             pf_diags.append(diag)
             # print(e.run_length, diag["ess"], diag["gini"])
 
+            # Optional switch: skip delta-GP refit (default True = always refit)
+            if not getattr(model_cfg, "refit_delta_every_batch", True):
+                continue
+
             X_hist = e.X_hist
             Y_hist = e.y_hist
             # diff = mu_eta_all - eta_mix_all[:,None]
@@ -516,6 +520,11 @@ class BOCPD:
 
             mu_eta_all, _ = emulator.predict(X_hist, e.pf.particles.theta)  # [M, N] or [M, N, dy]
             weights = e.pf.particles.weights().view(1, -1)  # [1, N]
+
+            # Guard against NaN weights (particle degeneracy) — keep old delta_state
+            if torch.isnan(weights).any() or weights.sum() < 1e-30:
+                continue
+
             if mu_eta_all.dim() == 2:
                 eta_mix_all = (weights * mu_eta_all).sum(dim=1)  # [M]
             else:
@@ -525,6 +534,10 @@ class BOCPD:
 
             # GPyTorchDeltaState expects y [M]; flatten multi-dim residual to scalar per row
             resid_for_delta = resid_all.mean(dim=-1) if resid_all.dim() > 1 and resid_all.shape[-1] > 1 else resid_all.reshape(-1)
+
+            # If residuals contain NaN/Inf, skip delta refit for this expert
+            if torch.isnan(resid_for_delta).any() or torch.isinf(resid_for_delta).any():
+                continue
 
             # # mu_eta_all: [M, N]
             # # weights: [1, N]
@@ -547,8 +560,11 @@ class BOCPD:
                 noise=model_cfg.delta_kernel.noise,
                 # noise=noise_vec,
             )
-            delta_state = fit_gpytorch_delta(delta_state, max_iter=150)
-            e.delta_state = delta_state
+            try:
+                delta_state = fit_gpytorch_delta(delta_state, max_iter=150)
+                e.delta_state = delta_state
+            except Exception:
+                pass  # keep old e.delta_state if fitting fails (e.g. NaN Cholesky)
             # e.delta_state = OnlineGPState(
             #     X=X_hist,
             #     y=resid_all,
