@@ -163,6 +163,7 @@ class ModelConfig:
     device: str = "cpu"
     dtype: torch.dtype = torch.float64
     use_discrepancy: bool = True
+    refit_delta_every_batch: bool = True   # if False, skip delta-GP refit each batch (saves time when delta is unused)
 
 
 @dataclass
