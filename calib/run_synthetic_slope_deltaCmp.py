@@ -965,12 +965,12 @@ def main():
     methods = {
         # "BPC-80": dict(type="bpc"),
         # "BOCPD-BPC": dict(type="bpc_bocpd"),
-        "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
-        "PF-OGP": dict(type="pf_ogp"),
-        "BOCPD-PF": dict(type="bocpd", mode="standard"),
+        # "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
+        # "PF-OGP": dict(type="pf_ogp"),
+        # "BOCPD-PF": dict(type="bocpd", mode="standard"),
         "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True, bocpd_use_discrepancy=True),
         "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
-        # "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
+        "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
     }
 
     all_results = {}

@@ -22,15 +22,21 @@ class DeterministicSimulator(Emulator):
             x = x[None, :]
         b = x.shape[0]
         N = theta.shape[0]
-        mu = []
+        mu_list = []
         for n in range(N):
-            out = self.func(x, theta[n:n+1, :]).squeeze(-1)  # [b]
-            mu.append(out)
-        mu_eta = torch.stack(mu, dim=1)  # [b,N]
+            out = self.func(x, theta[n:n+1, :])  # [b], [b,1], or [b, dy]
+            if out.dim() == 1:
+                out = out[:, None]  # [b, 1]
+            mu_list.append(out)
+        # Stack: each element [b, dy] -> stack dim=1 -> [b, N, dy]
+        mu_eta = torch.stack(mu_list, dim=1)  # [b, N, dy] with dy>=1
+        if mu_eta.shape[-1] == 1:
+            mu_eta = mu_eta.squeeze(-1)  # [b, N] for backward compat
         var_eta = torch.zeros_like(mu_eta)
         return mu_eta, var_eta
 
     def grad_theta(self, x: torch.Tensor, theta: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Gradient w.r.t. theta; supports only scalar output (dy=1). For dy>1, returns zeros."""
         if not self.enable_autograd:
             raise RuntimeError("grad_theta called but enable_autograd=False")
         if x.dim() == 1:
@@ -39,12 +45,15 @@ class DeterministicSimulator(Emulator):
         dmu = torch.zeros(b, N, dth, dtype=theta.dtype, device=theta.device)
         for n in range(N):
             th = theta[n:n+1, :].detach().requires_grad_(True)
-            y = self.func(x, th).squeeze(-1)  # [b]
-            for k in range(b):
-                grads = torch.autograd.grad(y[k], th, retain_graph=True, create_graph=False, allow_unused=True)[0]
-                if grads is None:
-                    grads = torch.zeros_like(th)
-                dmu[k, n, :] = grads.squeeze(0)
+            y = self.func(x, th)
+            out = y.squeeze(-1) if y.dim() > 1 else y
+            if out.dim() == 1:
+                for k in range(b):
+                    grads = torch.autograd.grad(out[k], th, retain_graph=True, create_graph=False, allow_unused=True)[0]
+                    if grads is None:
+                        grads = torch.zeros_like(th)
+                    dmu[k, n, :] = grads.squeeze(0)
+            # else: multi-dim output, grad_theta not implemented; leave dmu zero
         return dmu, None
 
 

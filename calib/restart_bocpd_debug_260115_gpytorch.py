@@ -514,10 +514,17 @@ class BOCPD:
             # noise_vec = noise_vec.reshape(-1)
             # print(f"noise_vec: {type(noise_vec)}, {noise_vec}")
 
-            mu_eta_all, _ = emulator.predict(X_hist, e.pf.particles.theta)  # shape [M, N]
+            mu_eta_all, _ = emulator.predict(X_hist, e.pf.particles.theta)  # [M, N] or [M, N, dy]
             weights = e.pf.particles.weights().view(1, -1)  # [1, N]
-            eta_mix_all = (weights * mu_eta_all).sum(dim=1)  # [M]
+            if mu_eta_all.dim() == 2:
+                eta_mix_all = (weights * mu_eta_all).sum(dim=1)  # [M]
+            else:
+                w = weights.unsqueeze(-1)  # [1, N, 1]
+                eta_mix_all = (w * mu_eta_all).sum(dim=1)  # [M, dy]
             resid_all = Y_hist - model_cfg.rho * eta_mix_all
+
+            # GPyTorchDeltaState expects y [M]; flatten multi-dim residual to scalar per row
+            resid_for_delta = resid_all.mean(dim=-1) if resid_all.dim() > 1 and resid_all.shape[-1] > 1 else resid_all.reshape(-1)
 
             # # mu_eta_all: [M, N]
             # # weights: [1, N]
@@ -535,7 +542,7 @@ class BOCPD:
             kernel = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
             delta_state = GPyTorchDeltaState(
                 X=X_hist,
-                y=resid_all,
+                y=resid_for_delta,
                 kernel=kernel,
                 noise=model_cfg.delta_kernel.noise,
                 # noise=noise_vec,

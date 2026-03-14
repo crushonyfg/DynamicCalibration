@@ -11,25 +11,35 @@ from .utils import normal_logpdf
 
 def predictive_stats(
     rho: float,
-    mu_eta: torch.Tensor,   # [b, N]
-    var_eta: torch.Tensor,  # [b, N]
-    mu_delta: torch.Tensor, # [b]
-    var_delta: torch.Tensor,# [b]
+    mu_eta: torch.Tensor,   # [b, N] or [b, N, dy]
+    var_eta: torch.Tensor,  # [b, N] or [b, N, dy]
+    mu_delta: torch.Tensor, # [b] or [b, dy]
+    var_delta: torch.Tensor,# [b] or [b, dy]
     sigma_eps: float
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Combine emulator eta and discrepancy delta with measurement noise.
     Y ~ N( rho*mu_eta + mu_delta , rho^2*var_eta + var_delta + sigma_eps^2 ).
     Returns:
-        mu_tot: [b, N]
-        var_tot: [b, N]
+        mu_tot: [b, N] or [b, N, dy] (same shape as mu_eta)
+        var_tot: [b, N] or [b, N, dy]
     """
-    try:
-        mu = rho * mu_eta + mu_delta[:, None]
-        var = (rho**2) * var_eta + var_delta[:, None] + (sigma_eps**2)
-    except:
-        mu = rho * mu_eta + mu_delta
-        var = (rho**2) * var_eta + var_delta + (sigma_eps**2)
+    if mu_eta.dim() == 2:
+        # scalar output: [b, N]
+        try:
+            mu = rho * mu_eta + mu_delta[:, None]
+            var = (rho**2) * var_eta + var_delta[:, None] + (sigma_eps**2)
+        except Exception:
+            mu = rho * mu_eta + mu_delta
+            var = (rho**2) * var_eta + var_delta + (sigma_eps**2)
+    else:
+        # multi-dim output: mu_eta/var_eta [b, N, dy]; delta [b] or [b, dy]
+        b, N, dy = mu_eta.shape
+        if mu_delta.dim() == 1:
+            mu_delta = mu_delta[:, None].expand(b, dy)
+            var_delta = var_delta[:, None].expand(b, dy)
+        mu = rho * mu_eta + mu_delta[:, None, :]  # [b,N,dy]
+        var = (rho**2) * var_eta + var_delta[:, None, :] + (sigma_eps**2)
     var = var.clamp_min(1e-12)
     return mu, var
 
@@ -142,21 +152,36 @@ def loglik_and_grads(
         x = x[None, :]
 
     # Emulator and discrepancy predictions
-    mu_eta, var_eta = emulator.predict(x, particles.theta)  # [b,N]
-    # mu_delta, var_delta = delta_state.predict(x)            # [b],[b]
+    mu_eta, var_eta = emulator.predict(x, particles.theta)  # [b,N] or [b,N,dy]
     if use_discrepancy:
         if delta_state is not None:
-            mu_delta, var_delta = delta_state.predict(x)            # [b],[b]
+            mu_delta, var_delta = delta_state.predict(x)  # [b], [b]
+            if mu_eta.dim() == 3:
+                dy = mu_eta.shape[-1]
+                mu_delta = mu_delta[:, None].expand(-1, dy)
+                var_delta = var_delta[:, None].expand(-1, dy)
         else:
-            mu_delta = torch.zeros_like(y)
-            var_delta = torch.ones_like(y)
+            # delta_state 为空时，与 use_discrepancy=False 行为一致（var_delta=0）
+            # 而不是使用 var_delta=1 这种人为放大方差的做法
+            if mu_eta.dim() == 3:
+                dy = mu_eta.shape[-1]
+                mu_delta = torch.zeros(x.shape[0], dy, dtype=mu_eta.dtype, device=mu_eta.device)
+                var_delta = torch.zeros(x.shape[0], dy, dtype=mu_eta.dtype, device=mu_eta.device)
+            else:
+                mu_delta = torch.zeros(x.shape[0], dtype=mu_eta.dtype, device=mu_eta.device)
+                var_delta = torch.zeros(x.shape[0], dtype=mu_eta.dtype, device=mu_eta.device)
     else:
-        mu_delta = 0.0
-        var_delta = 0.0
+        if mu_eta.dim() == 3:
+            dy = mu_eta.shape[-1]
+            mu_delta = torch.zeros(x.shape[0], dy, dtype=mu_eta.dtype, device=mu_eta.device)
+            var_delta = torch.zeros(x.shape[0], dy, dtype=mu_eta.dtype, device=mu_eta.device)
+        else:
+            mu_delta = torch.zeros(x.shape[0], dtype=mu_eta.dtype, device=mu_eta.device)
+            var_delta = torch.zeros(x.shape[0], dtype=mu_eta.dtype, device=mu_eta.device)
     mu_tot, var_tot = predictive_stats(rho, mu_eta, var_eta, mu_delta, var_delta, sigma_eps)
 
-    # Log-likelihood (per batch, per particle) -> assume online with b=1 commonly
-    loglik_bn = normal_logpdf(y, mu_tot, var_tot)           # [b,N]
+    # Log-likelihood (per batch, per particle); y: [b], [b,1], or [b,dy]
+    loglik_bn = normal_logpdf(y, mu_tot, var_tot)  # [b,N]
     out: Dict[str, torch.Tensor] = {"loglik": loglik_bn.sum(dim=0)}  # sum over b
 
     if not (need_grads or need_hessian):

@@ -277,6 +277,7 @@ def run_one_sudden(
         others_hist: List[dict] = []
         total_obs = 0
         top0_particles_hist = []
+        crps_hist = []
 
 
         # fresh stream per method (same data given same seed)
@@ -512,6 +513,9 @@ def run_one_sudden(
                     rmse_hist.append(
                         float(torch.sqrt(((pred["mu_sim"] - Yb) ** 2).mean()))
                     )
+                    crps = crps_gaussian(pred["mu"], pred["var"], Yb).mean()
+                    # print(crps)
+                    crps_hist.append(crps.item())
 
                 rec = calib.step_batch(Xb, Yb, verbose=False)
 
@@ -769,6 +773,7 @@ def run_one_sudden(
             batch_size=bs,
             seed=int(seed),
             top0_particles_hist=top0_particles_hist,
+            crps_hist=np.array(crps_hist),
         )
 
         print(f"     done in {time() - t0:.1f}s")
@@ -822,6 +827,7 @@ def main():
     args = parser.parse_args()
 
     out_dir = args.out_dir
+    store_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
 
     # --- experimental grid ---
@@ -841,13 +847,14 @@ def main():
 
     # methods
     methods = {
-        "BOCPD-PF": dict(type="bocpd", mode="standard"),
+        # "BOCPD-PF": dict(type="bocpd", mode="standard"),
         # "BPC-80": dict(type="bpc"),
         # "BOCPD-BPC": dict(type="bpc_bocpd"),
-        "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
-        "PF-OGP": dict(type="pf_ogp"),
+        # "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
+        # "PF-OGP": dict(type="pf_ogp"),
         "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
         "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
+        "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
         # "BPC-80": dict(type="bpc"),
     }
 
@@ -912,7 +919,8 @@ def main():
             
             all_metrics.append({
                 "method": method_name,
-                "slope": s,
+                "seg_len_L": seg_len_L,
+                "delta_mag": delta_mag,
                 "batch_size": batch_size,
                 "seed": seed,
                 "theta_rmse": theta_rmse,

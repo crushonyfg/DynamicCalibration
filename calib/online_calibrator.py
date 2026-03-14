@@ -151,44 +151,62 @@ class OnlineBayesCalibrator:
         return out
 
     def predict_batch(self, X_batch: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """批量预测"""
+        """批量预测。支持标量 y（mu/var [batch]）与多维 y（mu/var [batch, dy]）。"""
         X_batch = X_batch.to(self.cfg.model.device, self.cfg.model.dtype)
         batch_size = X_batch.shape[0]
-        
-        mix_mu = torch.zeros(batch_size, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
-        mix_var = torch.zeros(batch_size, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
+        if len(self.bocpd.experts) == 0:
+            return {"mu": torch.zeros(batch_size, device=X_batch.device, dtype=X_batch.dtype),
+                    "var": torch.ones(batch_size, device=X_batch.device, dtype=X_batch.dtype),
+                    "experts_res": [], "mu_sim": torch.zeros(batch_size, device=X_batch.device, dtype=X_batch.dtype)}
+        # Infer output dim from first expert's emulator predict
+        mu_eta0, _ = self.emulator.predict(X_batch[:1], self.bocpd.experts[0].pf.particles.theta[:1])
+        dy = mu_eta0.shape[-1] if mu_eta0.dim() == 3 else 1
+        if dy == 1:
+            mix_mu = torch.zeros(batch_size, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
+            mix_var = torch.zeros(batch_size, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
+            mix_mu_sim = torch.zeros(batch_size, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
+        else:
+            mix_mu = torch.zeros(batch_size, dy, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
+            mix_var = torch.zeros(batch_size, dy, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
+            mix_mu_sim = torch.zeros(batch_size, dy, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
         Z = 0.0
         experts_res = []
 
-        mix_mu_sim = torch.zeros(batch_size, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
-        mix_var_sim = torch.zeros(batch_size, dtype=self.cfg.model.dtype, device=self.cfg.model.device)
-
         for e in self.bocpd.experts:
             w_e = math.exp(e.log_mass)
-            mu_eta, var_eta = self.emulator.predict(X_batch, e.pf.particles.theta)  # [batch_size, N]
+            mu_eta, var_eta = self.emulator.predict(X_batch, e.pf.particles.theta)  # [B, N] or [B, N, dy]
             try:
-                mu_delta, var_delta = e.delta_state.predict(X_batch)  # [batch_size]
-            except:
+                mu_delta, var_delta = e.delta_state.predict(X_batch)  # [B]
+            except Exception:
                 mu_deltas, var_deltas = [], []
                 for delta_state in e.delta_states:
-                    mu_delta, var_delta = delta_state.predict(X_batch)  # [batch_size]
-                    mu_deltas.append(mu_delta)
-                    var_deltas.append(var_delta)
+                    md, vd = delta_state.predict(X_batch)
+                    mu_deltas.append(md)
+                    var_deltas.append(vd)
                 mu_delta = torch.stack(mu_deltas, dim=1).mean(dim=1)
                 var_delta = torch.stack(var_deltas, dim=1).mean(dim=1)
+            if mu_eta.dim() == 3 and mu_delta.dim() == 1:
+                mu_delta = mu_delta[:, None].expand(-1, mu_eta.shape[-1])
+                var_delta = var_delta[:, None].expand(-1, mu_eta.shape[-1])
             mu, var = predictive_stats(self.cfg.model.rho, mu_eta, var_eta, mu_delta, var_delta, self.cfg.model.sigma_eps)
             w = e.pf.particles.weights()[None, :]
-            mu_mix = (w * mu).sum(dim=1)  # [batch_size]
-            var_mix = (w * (var + mu**2)).sum(dim=1) - mu_mix**2
+            if mu.dim() == 2:
+                mu_mix = (w * mu).sum(dim=1)  # [B]
+                var_mix = (w * (var + mu**2)).sum(dim=1) - mu_mix**2
+            else:
+                mu_mix = (w[:, :, None] * mu).sum(dim=1)  # [B, dy]
+                var_mix = (w[:, :, None] * (var + mu**2)).sum(dim=1) - mu_mix**2
             mix_mu += w_e * mu_mix
             mix_var += w_e * var_mix
-            Z += w_e
             experts_res.append({"mu_delta": mu_delta, "var_delta": var_delta, "w": w_e, "mu": mu_mix, "var": var_mix})
-
-            mu_sim = self.cfg.model.rho*mu_eta 
-            mu_sim_mix = (w * mu_sim).sum(dim=1)
+            mu_sim = self.cfg.model.rho * mu_eta
+            if mu_sim.dim() == 2:
+                mu_sim_mix = (w * mu_sim).sum(dim=1)
+            else:
+                mu_sim_mix = (w[:, :, None] * mu_sim).sum(dim=1)
             mix_mu_sim += w_e * mu_sim_mix
-        
+            Z += w_e
+
         mix_mu = mix_mu / max(Z, 1e-12)
         mix_var = mix_var / max(Z, 1e-12)
         mix_mu_sim = mix_mu_sim / max(Z, 1e-12)
@@ -202,84 +220,73 @@ class OnlineBayesCalibrator:
         X_batch = X_batch.to(self.cfg.model.device, self.cfg.model.dtype)
         y_batch = y_batch.to(self.cfg.model.device, self.cfg.model.dtype)
         batch_size = X_batch.shape[0]
-
-        mix_mu = torch.zeros(batch_size, dtype=X_batch.dtype, device=X_batch.device)
-        mix_var = torch.zeros(batch_size, dtype=X_batch.dtype, device=X_batch.device)
-        mix_mu_sim = torch.zeros(batch_size, dtype=X_batch.dtype, device=X_batch.device)
-
+        # Infer dy from first expert
+        if len(self.bocpd.experts) == 0:
+            return {"mix_mu": None, "mix_var": None, "mu_sim": None, "var_sim": None, "crps_sim": None, "experts_logpred": []}
+        mu_eta0, _ = self.emulator.predict(X_batch[:1], self.bocpd.experts[0].pf.particles.theta[:1])
+        dy = mu_eta0.shape[-1] if mu_eta0.dim() == 3 else 1
+        if dy == 1:
+            mix_mu = torch.zeros(batch_size, dtype=X_batch.dtype, device=X_batch.device)
+            mix_var = torch.zeros(batch_size, dtype=X_batch.dtype, device=X_batch.device)
+            mix_mu_sim = torch.zeros(batch_size, dtype=X_batch.dtype, device=X_batch.device)
+        else:
+            mix_mu = torch.zeros(batch_size, dy, dtype=X_batch.dtype, device=X_batch.device)
+            mix_var = torch.zeros(batch_size, dy, dtype=X_batch.dtype, device=X_batch.device)
+            mix_mu_sim = torch.zeros(batch_size, dy, dtype=X_batch.dtype, device=X_batch.device)
         Z = 0.0
         experts_logpred = []
 
+        y_ = y_batch if y_batch.dim() >= 2 else y_batch.unsqueeze(-1)  # [B, dy]
+        if dy > 1 and y_.shape[-1] == 1:
+            y_ = y_.expand(-1, dy)
+
         for e in self.bocpd.experts:
-            w_e = math.exp(e.log_mass)   # expert mass (unnormalized)
-
-            # ---------- emulator ----------
-            mu_eta, var_eta = self.emulator.predict(
-                X_batch, e.pf.particles.theta
-            )  # [B, Np]
-
-            # ---------- delta ----------
+            w_e = math.exp(e.log_mass)
+            mu_eta, var_eta = self.emulator.predict(X_batch, e.pf.particles.theta)
             try:
-                mu_delta, var_delta = e.delta_state.predict(X_batch)  # [B]
-            except:
+                mu_delta, var_delta = e.delta_state.predict(X_batch)
+            except Exception:
                 mu_deltas, var_deltas = [], []
-                for delta_state in e.delta_states:
-                    mu_d, var_d = delta_state.predict(X_batch)
-                    mu_deltas.append(mu_d)
-                    var_deltas.append(var_d)
+                for ds in e.delta_states:
+                    md, vd = ds.predict(X_batch)
+                    mu_deltas.append(md)
+                    var_deltas.append(vd)
                 mu_delta = torch.stack(mu_deltas, dim=1).mean(dim=1)
                 var_delta = torch.stack(var_deltas, dim=1).mean(dim=1)
-
-            # ---------- full predictive (particle-level) ----------
+            if mu_eta.dim() == 3 and mu_delta.dim() == 1:
+                mu_delta = mu_delta[:, None].expand(-1, mu_eta.shape[-1])
+                var_delta = var_delta[:, None].expand(-1, mu_eta.shape[-1])
             mu, var = predictive_stats(
-                self.cfg.model.rho,
-                mu_eta, var_eta,
-                mu_delta, var_delta,
-                self.cfg.model.sigma_eps,
-            )  # mu,var: [B, Np]
-
-            # PF particle weights
-            w = e.pf.particles.weights()[None, :]  # [1, Np]
-
-            # ---------- expert-level Gaussian (moment matched) ----------
-            mu_e = (w * mu).sum(dim=1)  # [B]
-            var_e = (w * (var + mu**2)).sum(dim=1) - mu_e**2  # [B]
-
+                self.cfg.model.rho, mu_eta, var_eta, mu_delta, var_delta, self.cfg.model.sigma_eps,
+            )
+            w = e.pf.particles.weights()[None, :]
+            if mu.dim() == 2:
+                mu_e = (w * mu).sum(dim=1)
+                var_e = (w * (var + mu**2)).sum(dim=1) - mu_e**2
+            else:
+                mu_e = (w[:, :, None] * mu).sum(dim=1)
+                var_e = (w[:, :, None] * (var + mu**2)).sum(dim=1) - mu_e**2
             mix_mu += w_e * mu_e
             mix_var += w_e * var_e
-
-            # ---------- simulator-only ----------
             mu_sim = self.cfg.model.rho * mu_eta
-            mu_sim_e = (w * mu_sim).sum(dim=1)
+            if mu_sim.dim() == 2:
+                mu_sim_e = (w * mu_sim).sum(dim=1)
+            else:
+                mu_sim_e = (w[:, :, None] * mu_sim).sum(dim=1)
             mix_mu_sim += w_e * mu_sim_e
-
-            # ---------- expert log predictive (Gaussian approx) ----------
-            # log N(y | mu_e, var_e)
+            # log N(y | mu_e, var_e); for dy>1 sum over dims (independent)
             logp_e = -0.5 * (
                 torch.log(2.0 * math.pi * torch.clamp(var_e, min=1e-12))
-                + (y_batch - mu_e)**2 / torch.clamp(var_e, min=1e-12)
+                + (y_ - mu_e)**2 / torch.clamp(var_e, min=1e-12)
             )
-            logp_e = logp_e.mean()  # batch average
-
-            experts_logpred.append({
-                "logp": logp_e.detach(),
-                "weight": w_e,
-                "log_mass": e.log_mass,
-            })
-
+            logp_e = logp_e.sum(dim=-1).mean()
+            experts_logpred.append({"logp": logp_e.detach(), "weight": w_e, "log_mass": e.log_mass})
             Z += w_e
 
-        # ---------- normalize mixture ----------
         Z = max(Z, 1e-12)
         mix_mu = mix_mu / Z
         mix_var = mix_var / Z
         mix_mu_sim = mix_mu_sim / Z
-
-        # ---------- simulator-only Gaussian CRPS ----------
-        # need simulator-only variance
-        # approximate: Var_sim = Var[rho * mu_eta] under particle+expert mixture
-        # (no delta, no obs noise)
-        # reuse second moment trick
 
         Ey2_sim = torch.zeros_like(mix_mu_sim)
         for e in self.bocpd.experts:
@@ -287,12 +294,13 @@ class OnlineBayesCalibrator:
             mu_eta, _ = self.emulator.predict(X_batch, e.pf.particles.theta)
             mu_sim = self.cfg.model.rho * mu_eta
             w = e.pf.particles.weights()[None, :]
-            Ey2_sim += w_e * (w * mu_sim**2).sum(dim=1)
-
+            if mu_sim.dim() == 2:
+                Ey2_sim += w_e * (w * mu_sim**2).sum(dim=1)
+            else:
+                Ey2_sim += w_e * (w[:, :, None] * mu_sim**2).sum(dim=1)
         Ey2_sim = Ey2_sim / Z
         var_sim = torch.clamp(Ey2_sim - mix_mu_sim**2, min=1e-12)
-
-        crps_sim = crps_gaussian(mix_mu_sim, var_sim, y_batch).mean()
+        crps_sim = crps_gaussian(mix_mu_sim, var_sim, y_ if y_batch.dim() >= 2 else y_batch).mean()
 
         return {
             "mix_mu": mix_mu,
@@ -355,22 +363,41 @@ class OnlineBayesCalibrator:
             return mean, cov, lo, hi
 
     def predict(self, x_next: torch.Tensor) -> Dict[str, torch.Tensor]:
-        # mixture over experts and their particles
+        """单点预测；支持标量/多维 y（返回 mu, var 与 emulator 输出维度一致）。"""
         xs = x_next.to(self.cfg.model.device, self.cfg.model.dtype)
-        mix_mu = 0.0
-        mix_var = 0.0
+        if xs.dim() == 1:
+            xs = xs[None, :]
+        if len(self.bocpd.experts) == 0:
+            return {"mu": None, "var": None}
+        mu_eta0, _ = self.emulator.predict(xs, self.bocpd.experts[0].pf.particles.theta[:1])
+        dy = mu_eta0.shape[-1] if mu_eta0.dim() == 3 else 1
+        if dy == 1:
+            mix_mu = torch.zeros(1, dtype=xs.dtype, device=xs.device)
+            mix_var = torch.zeros(1, dtype=xs.dtype, device=xs.device)
+        else:
+            mix_mu = torch.zeros(dy, dtype=xs.dtype, device=xs.device)
+            mix_var = torch.zeros(dy, dtype=xs.dtype, device=xs.device)
         Z = 0.0
         for e in self.bocpd.experts:
             w_e = math.exp(e.log_mass)
-            mu_eta, var_eta = self.emulator.predict(xs[None, :], e.pf.particles.theta)  # [1,N]
-            mu_delta, var_delta = e.delta_state.predict(xs[None, :])  # [1]
+            mu_eta, var_eta = self.emulator.predict(xs, e.pf.particles.theta)
+            mu_delta, var_delta = e.delta_state.predict(xs)
+            if mu_eta.dim() == 3 and mu_delta.dim() == 1:
+                mu_delta = mu_delta[:, None].expand(-1, mu_eta.shape[-1])
+                var_delta = var_delta[:, None].expand(-1, mu_eta.shape[-1])
             mu, var = predictive_stats(self.cfg.model.rho, mu_eta, var_eta, mu_delta, var_delta, self.cfg.model.sigma_eps)
             w = e.pf.particles.weights()[None, :]
-            mu_mix = (w * mu).sum(dim=1)  # [1]
-            var_mix = (w * (var + mu**2)).sum(dim=1) - mu_mix**2
-            mix_mu += w_e * mu_mix.squeeze(0)
-            mix_var += w_e * var_mix.squeeze(0)
+            if mu.dim() == 2:
+                mu_mix = (w * mu).sum(dim=1)
+                var_mix = (w * (var + mu**2)).sum(dim=1) - mu_mix**2
+            else:
+                mu_mix = (w[:, :, None] * mu).sum(dim=1).squeeze(0)
+                var_mix = (w[:, :, None] * (var + mu**2)).sum(dim=1).squeeze(0) - mu_mix**2
+            mix_mu += w_e * mu_mix
+            mix_var += w_e * var_mix
             Z += w_e
         mix_mu = mix_mu / max(Z, 1e-12)
         mix_var = mix_var / max(Z, 1e-12)
+        if dy == 1:
+            mix_mu, mix_var = mix_mu.squeeze(0), mix_var.squeeze(0)
         return {"mu": mix_mu, "var": mix_var}
