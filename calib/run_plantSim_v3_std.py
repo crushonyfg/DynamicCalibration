@@ -452,7 +452,8 @@ def batch_y_to_s(gt: GlobalTransformSep, yb: np.ndarray) -> torch.Tensor:
 # =========================
 # 7) Pipeline initialisation & helpers
 # =========================
-_DEFAULT_NPZ = r"C:/Users/yxu59/files/winter2026/park/simulation/ComputerData_v3/factory_aggregated.npz"
+# _DEFAULT_NPZ = r"C:/Users/yxu59/files/winter2026/park/simulation/ComputerData_v3/factory_aggregated.npz"
+_DEFAULT_NPZ = r"factory_aggregated.npz"
 
 # Module-level globals — populated by init_pipeline()
 gt  = None   # type: GlobalTransformSep

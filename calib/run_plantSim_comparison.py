@@ -292,7 +292,7 @@ def main():
     parser.add_argument("--npz", type=str, default=None,
                         help="Computer-data NPZ (factory_aggregated.npz)")
     parser.add_argument("--modes", type=int, nargs="+", default=[0, 1, 2],
-                        help="Data modes (0=gradual, 1=mixed, 2=jumps)")
+                        help="Data modes (0=gradual, 1=jumps, 2=mixed)")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--koh_window", type=int, default=20,
                         help="KOH sliding window (number of batches)")
@@ -317,8 +317,8 @@ def main():
 
     MODE_NAMES = {
         0: "Gradual (mode 0)",
-        1: "Mixed (mode 1)",
-        2: "Sudden Jump (mode 2)",
+        1: "Sudden Jump (mode 1)",
+        2: "Mixed (mode 2)",
     }
 
     all_results: Dict[int, dict] = {}
@@ -340,7 +340,7 @@ def main():
             n_particles=args.n_particles,
             theta_lo_s=a_s,
             theta_hi_s=b_s,
-            sigma_obs_s=sigma_obs_s,
+            sigma_obs_s=0.05,
             resample_ess_ratio=0.5,
             theta_move_std_s=0.1 / gt_tf.theta_sd,
             seed=42,
@@ -356,7 +356,7 @@ def main():
 
             pf.update_batch(newX, newY)
             mean_raw = gt_tf.theta_s_to_raw(pf.mean_theta_s())
-            da_theta.append(mean_raw)
+            da_theta.append(float(mean_raw))
             da_gt.append(float(np.mean(thb)))
         print(f"  DA   done in {timer() - t0:.1f}s  ({len(da_theta)} batches)")
 
@@ -386,7 +386,7 @@ def main():
             koh.update_batch(Xb_s, Yb_s)
 
             mean_raw = gt_tf.theta_s_to_raw(koh.mean_theta_s())
-            bc_theta.append(mean_raw)
+            bc_theta.append(float(mean_raw))
             bc_gt.append(float(np.mean(thb)))
         print(f"  BC   done in {timer() - t0:.1f}s  ({len(bc_theta)} batches)")
 
@@ -402,7 +402,7 @@ def main():
         cfg.model.use_discrepancy = False
         cfg.model.refit_delta_every_batch = False
         cfg.model.bocpd_use_discrepancy = False
-        cfg.model.sigma_eps = sigma_obs_s
+        # cfg.model.sigma_eps = sigma_obs_s
 
         calib = OnlineBayesCalibrator(cfg, emu, prior_sampler)
 
@@ -418,7 +418,7 @@ def main():
 
             mean_theta_s, var_theta_s, lo_s, hi_s = calib._aggregate_particles(0.9)
             mean_raw = gt_tf.theta_s_to_raw(float(mean_theta_s[0]))
-            ours_theta.append(mean_raw)
+            ours_theta.append(float(mean_raw))
             ours_gt.append(float(np.mean(thb)))
         print(f"  Ours done in {timer() - t0:.1f}s  ({len(ours_theta)} batches)")
 
@@ -446,10 +446,10 @@ def main():
             for j in range(n):
                 writer.writerow([
                     j,
-                    f"{gt_arr[j]:.6f}",
-                    f"{all_results[mode]['DA'][j]:.6f}",
-                    f"{all_results[mode]['BC'][j]:.6f}",
-                    f"{all_results[mode]['Ours'][j]:.6f}",
+                    f"{float(gt_arr[j]):.6f}",
+                    f"{float(all_results[mode]['DA'][j]):.6f}",
+                    f"{float(all_results[mode]['BC'][j]):.6f}",
+                    f"{float(all_results[mode]['Ours'][j]):.6f}",
                 ])
         print(f"  [Saved] θ log → {log_path}")
 
