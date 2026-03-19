@@ -525,6 +525,40 @@ def batches(stream: StreamClass, batch_size: int):
         except StopIteration:
             break
 
+def summarize_metrics(result: dict):
+    """Compute theta/y metrics from one method result dict."""
+    theta = np.asarray(result.get("theta_hist", []), dtype=float)
+    theta_var = np.asarray(result.get("theta_var_hist", []), dtype=float)
+    gt_theta = np.asarray(result.get("gt_theta_hist", []), dtype=float)
+    y_rmse_hist = np.asarray(result.get("rmse_hist", []), dtype=float)
+    y_crps_hist = np.asarray(result.get("y_crps_hist", []), dtype=float)
+
+    n_theta = min(len(theta), len(gt_theta), len(theta_var))
+    if n_theta == 0:
+        theta_rmse = float("nan")
+        theta_crps = float("nan")
+    else:
+        theta_rmse = float(np.sqrt(np.mean((theta[:n_theta] - gt_theta[:n_theta]) ** 2)))
+        theta_var_clip = np.clip(theta_var[:n_theta], 1e-12, None)
+        theta_crps = float(
+            crps_gaussian(
+                torch.tensor(theta[:n_theta], dtype=torch.float64),
+                torch.tensor(theta_var_clip, dtype=torch.float64),
+                torch.tensor(gt_theta[:n_theta], dtype=torch.float64),
+            ).mean().item()
+        )
+
+    # rmse_hist has an initial placeholder 0 in this script
+    y_rmse = float(np.mean(y_rmse_hist[1:])) if len(y_rmse_hist) > 1 else float("nan")
+    y_crps = float(np.mean(y_crps_hist)) if len(y_crps_hist) > 0 else float("nan")
+
+    return dict(
+        theta_rmse=theta_rmse,
+        theta_crps=theta_crps,
+        y_rmse=y_rmse,
+        y_crps=y_crps,
+    )
+
 def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
     if data_dir is None and csv_path is None:
         data_dir = "C:/Users/yxu59/files/winter2026/park/simulation/PhysicalData_v3"
@@ -537,6 +571,7 @@ def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
     for name, meta in methods.items():
         theta_hist, theta_var_hist, gt_theta_hist = [], [], []
         rmse_hist, comp_rmse_hist = [0], [0]
+        y_crps_hist = []
         restart_hist = []
         idx = 0
         batch_size = batch_size
@@ -611,6 +646,8 @@ def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
                     mu_raw = gt.y_s_to_raw(mix_mu.cpu().numpy())
                     rmse = float(np.sqrt(np.mean((mu_raw - np.asarray(yb))**2)))
                     rmse_hist.append(rmse)
+                    y_crps = crps_gaussian(mix_mu.detach().cpu(), mix_var.detach().cpu(), newY.detach().cpu()).mean()
+                    y_crps_hist.append(float(y_crps.item()))
                 idx += 1
 
                 rec = bocpd.update_batch(
@@ -682,6 +719,8 @@ def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
                     mu_raw = gt.y_s_to_raw(mu_mix.cpu().numpy())
                     rmse = float(np.sqrt(np.mean((mu_raw - np.asarray(yb))**2)))
                     rmse_hist.append(rmse)
+                    y_crps = crps_gaussian(mu_mix.detach().cpu(), var_mix.detach().cpu(), newY.detach().cpu()).mean()
+                    y_crps_hist.append(float(y_crps.item()))
                 idx += 1
 
                 pf.step_batch(
@@ -735,6 +774,8 @@ def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
                     mu_raw = gt.y_s_to_raw(mu_s)
                     rmse = float(np.sqrt(np.mean((mu_raw - np.asarray(yb))**2)))
                     rmse_hist.append(rmse)
+                    y_crps = crps_gaussian(pred["mu"].detach().cpu(), pred["var"].detach().cpu(), newY.detach().cpu()).mean()
+                    y_crps_hist.append(float(y_crps.item()))
                     report_sub_hist = (pred_comp["crps_sim"].item(),pred_comp["experts_logpred"],pred_comp["var_sim"])
                     comp_rmse_hist.append(report_sub_hist)
 
@@ -773,7 +814,15 @@ def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
 
             # restart_hist.append(rec["did_restart"])
 
-        results[name] = dict(theta_hist=theta_hist, theta_var_hist=theta_var_hist, gt_theta_hist=gt_theta_hist, rmse_hist=rmse_hist, comp_rmse_hist=comp_rmse_hist, restart_hist=restart_hist)
+        results[name] = dict(
+            theta_hist=theta_hist,
+            theta_var_hist=theta_var_hist,
+            gt_theta_hist=gt_theta_hist,
+            rmse_hist=rmse_hist,
+            y_crps_hist=y_crps_hist,
+            comp_rmse_hist=comp_rmse_hist,
+            restart_hist=restart_hist,
+        )
     return results
 
 if __name__ == "__main__":
@@ -796,10 +845,11 @@ if __name__ == "__main__":
         # "BPC-80": dict(type="bpc"),
         # "BOCPD-BPC": dict(type="bpc_bocpd"),
         "R-BOCPD-PF-OGP": dict(type="ogp_bocpd"),
-        "PF-OGP": dict(type="pf_ogp"),
+        # "PF-OGP": dict(type="pf_ogp"),
         # "BOCPD-PF": dict(type="bocpd", mode="standard"),
-        # "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
-        # "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False),
+        "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
+        "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False),
+        "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
         # "BPC-80": dict(type="bpc"),
     }
     all_results = {}
@@ -813,6 +863,19 @@ if __name__ == "__main__":
                 csv_path=args.csv,
             )
             all_results[f"mode{mode}_bs{bs}"] = results
+
+            print("\n" + "=" * 70)
+            print(f"Mode={mode}, batch_size={bs} metrics")
+            print("=" * 70)
+            for name, result in results.items():
+                metrics = summarize_metrics(result)
+                print(
+                    f"{name}: "
+                    f"theta_rmse={metrics['theta_rmse']:.6f}, "
+                    f"theta_crps={metrics['theta_crps']:.6f}, "
+                    f"y_rmse={metrics['y_rmse']:.6f}, "
+                    f"y_crps={metrics['y_crps']:.6f}"
+                )
 
             plt.figure(figsize=(10, 5))
             for name, result in results.items():

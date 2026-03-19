@@ -28,6 +28,7 @@ from .bocpd_gpytorch import BOCPD as StandardBOCPD
 
 # from .restart_bocpd_debug_260108 import BOCPD as RestartBOCPD
 # from .restart_bocpd_debug_260114 import BOCPD as RestartBOCPD
+# default restart implementation
 from .restart_bocpd_debug_260115_gpytorch import BOCPD as RestartBOCPD
 # from .restart_bocpd_260123_noisevec import BOCPD as RestartBOCPD
 
@@ -93,8 +94,13 @@ class OnlineBayesCalibrator:
 
         bocpd_mode = getattr(calib_cfg.bocpd, "bocpd_mode", "standard").lower()
         if bocpd_mode == "restart":
+            restart_impl = str(getattr(calib_cfg.bocpd, "restart_impl", "debug_260115")).lower()
+            if restart_impl in {"hybrid", "hybrid_260319"}:
+                from .restart_bocpd_hybrid_260319_gpytorch import BOCPD as RestartBOCPDImpl
+            else:
+                RestartBOCPDImpl = RestartBOCPD
             # 使用 R-BOCPD 实现（restart_bocpd.py）
-            self.bocpd = RestartBOCPD(
+            self.bocpd = RestartBOCPDImpl(
                 config=config.bocpd,
                 device=config.model.device,
                 dtype=config.model.dtype,

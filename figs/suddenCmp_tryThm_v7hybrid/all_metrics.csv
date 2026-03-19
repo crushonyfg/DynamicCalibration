@@ -1,0 +1,3 @@
+method,seg_len_L,delta_mag,batch_size,seed,theta_rmse,y_rmse,y_crps
+R-BOCPD-PF-halfdiscrepancy,120,2.0,20,456,0.014308100693039305,1.7060810347448758,0.5358006073375193
+R-BOCPD-PF-halfdiscrepancy-hybrid,120,2.0,20,456,0.015107654051202523,1.7057250668435804,0.5384381146360763

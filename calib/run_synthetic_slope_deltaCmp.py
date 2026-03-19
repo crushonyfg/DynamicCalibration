@@ -29,6 +29,8 @@ from .restart_bocpd_ogp_gpytorch import (
     RollingStats as OGPRollingStats, make_fast_batched_grad_func,
 )
 from .configs import BOCPDConfig, ModelConfig
+from scipy.special import logsumexp
+from scipy.spatial.distance import cdist
 
 # -------------------------------------------------------------
 # Simulator (Config2)
@@ -252,6 +254,221 @@ def oracle_theta(phi: np.ndarray, grid: np.ndarray) -> float:
     return grid[np.argmin(errs)]
 
 
+# =====================================================================
+# DA: PF (simple likelihood) + GP discrepancy for y-prediction only
+# =====================================================================
+class PFWithGPPrediction:
+    """
+    DA method.
+    PF update: p(y|x,θ) = N(y; sim(x,θ), σ²)  — no GP in likelihood.
+    y-prediction: y_pred = sim(x, θ_mean) + GP_discrepancy(x), with GP variance.
+    GP is refitted every batch on residuals r = y - sim(x, θ_mean).
+    """
+
+    def __init__(self, sim_func_np, n_particles=1024,
+                 theta_lo=0.0, theta_hi=3.0, sigma_obs=0.2,
+                 resample_ess_ratio=0.5, theta_move_std=0.05,
+                 window_size=80, gp_lengthscale=0.3, gp_signal_var=1.0,
+                 seed=42):
+        self.sim = sim_func_np
+        self.N = n_particles
+        self.lo, self.hi = theta_lo, theta_hi
+        self.sigma2 = sigma_obs ** 2
+        self.ess_ratio = resample_ess_ratio
+        self.move_std = theta_move_std
+        self.rng = np.random.default_rng(seed)
+        self.theta = self.rng.uniform(self.lo, self.hi, size=self.N)
+        self.logw = np.zeros(self.N) - np.log(self.N)
+
+        self.W = window_size
+        self.X_buf, self.Y_buf = [], []
+        self.ls = gp_lengthscale
+        self.sv = gp_signal_var
+
+        self._gp_L = None
+        self._gp_alpha = None
+        self._gp_X = None
+
+    def _normalize_logw(self):
+        self.logw -= logsumexp(self.logw)
+
+    def _ess(self):
+        return 1.0 / np.sum(np.exp(self.logw) ** 2)
+
+    def _systematic_resample(self):
+        w = np.exp(self.logw)
+        positions = (self.rng.random() + np.arange(self.N)) / self.N
+        idx = np.searchsorted(np.cumsum(w), positions, side="left")
+        idx = np.clip(idx, 0, self.N - 1)
+        self.theta = self.theta[idx]
+        self.logw[:] = -np.log(self.N)
+
+    def _rejuvenate(self):
+        self.theta += self.rng.normal(0.0, self.move_std, size=self.N)
+        self.theta = np.clip(self.theta, self.lo, self.hi)
+
+    def mean_theta(self):
+        return float(np.sum(np.exp(self.logw) * self.theta))
+
+    def _fit_gp(self):
+        X_all = np.concatenate(self.X_buf, axis=0)
+        Y_all = np.concatenate(self.Y_buf, axis=0)
+        if len(X_all) > self.W:
+            X_all, Y_all = X_all[-self.W:], Y_all[-self.W:]
+            self.X_buf, self.Y_buf = [X_all], [Y_all]
+        n = len(X_all)
+        if n < 3:
+            self._gp_L = None
+            return
+        th_mean = self.mean_theta()
+        sim_pred = self.sim(X_all, np.full((n, 1), th_mean))
+        residuals = Y_all - sim_pred
+        dist_sq = cdist(X_all, X_all, metric="sqeuclidean")
+        K = self.sv * np.exp(-0.5 * dist_sq / self.ls ** 2) + self.sigma2 * np.eye(n) + 1e-6 * np.eye(n)
+        try:
+            L = np.linalg.cholesky(K)
+        except np.linalg.LinAlgError:
+            K += 1e-4 * np.eye(n)
+            try:
+                L = np.linalg.cholesky(K)
+            except np.linalg.LinAlgError:
+                self._gp_L = None
+                return
+        self._gp_L = L
+        self._gp_alpha = np.linalg.solve(L.T, np.linalg.solve(L, residuals))
+        self._gp_X = X_all
+
+    def predict(self, X_new):
+        n_new = X_new.shape[0]
+        th_mean = self.mean_theta()
+        sim_pred = self.sim(X_new, np.full((n_new, 1), th_mean))
+        if self._gp_L is None or self._gp_X is None:
+            return sim_pred, np.full(n_new, self.sigma2)
+        k_star = self.sv * np.exp(-0.5 * cdist(X_new, self._gp_X, metric="sqeuclidean") / self.ls ** 2)
+        gp_mu = k_star @ self._gp_alpha
+        v = np.linalg.solve(self._gp_L, k_star.T)
+        gp_var = np.maximum(self.sv + self.sigma2 - np.sum(v ** 2, axis=0), 1e-8)
+        return sim_pred + gp_mu, gp_var
+
+    def update_batch(self, Xb_np, Yb_np):
+        self.X_buf.append(Xb_np.copy())
+        self.Y_buf.append(Yb_np.copy())
+
+        B = Xb_np.shape[0]
+        X_rep = np.tile(Xb_np, (self.N, 1))
+        th_rep = np.repeat(self.theta, B)[:, None]
+        pred_all = self.sim(X_rep, th_rep).reshape(self.N, B)
+        resid = Yb_np[None, :] - pred_all
+        loglik = np.sum(
+            -0.5 * (resid ** 2 / self.sigma2 + np.log(2 * np.pi * self.sigma2)),
+            axis=1,
+        )
+
+        self.logw += loglik
+        self._normalize_logw()
+        if self._ess() < self.ess_ratio * self.N:
+            self._systematic_resample()
+            self._rejuvenate()
+
+        self._fit_gp()
+
+
+# =====================================================================
+# BC: KOH Sliding Window
+# =====================================================================
+class KOHSlidingWindow:
+    """
+    BC method.
+    KOH-style batch calibration: profile GP marginal log-likelihood
+    over a theta grid, with a sliding window of observations.
+    Also fits a prediction GP for computing RMSE / CRPS.
+    """
+
+    def __init__(self, sim_func_np, theta_grid, window_size=80,
+                 sigma_obs=0.2, gp_lengthscale=0.3, gp_signal_var=1.0):
+        self.sim = sim_func_np
+        self.theta_grid = theta_grid
+        self.W = window_size
+        self.sigma2 = sigma_obs ** 2
+        self.ls = gp_lengthscale
+        self.sv = gp_signal_var
+        self.X_buf, self.Y_buf = [], []
+        self.current_theta = float(np.median(theta_grid))
+
+        self._gp_L = None
+        self._gp_alpha = None
+        self._gp_X = None
+
+    def _fit_prediction_gp(self, X_all, Y_all):
+        n = len(X_all)
+        if n < 3:
+            self._gp_L = None
+            return
+        sim_pred = self.sim(X_all, np.full((n, 1), self.current_theta))
+        residuals = Y_all - sim_pred
+        dist_sq = cdist(X_all, X_all, metric="sqeuclidean")
+        K = self.sv * np.exp(-0.5 * dist_sq / self.ls ** 2) + self.sigma2 * np.eye(n) + 1e-6 * np.eye(n)
+        try:
+            L = np.linalg.cholesky(K)
+        except np.linalg.LinAlgError:
+            K += 1e-4 * np.eye(n)
+            try:
+                L = np.linalg.cholesky(K)
+            except np.linalg.LinAlgError:
+                self._gp_L = None
+                return
+        self._gp_L = L
+        self._gp_alpha = np.linalg.solve(L.T, np.linalg.solve(L, residuals))
+        self._gp_X = X_all
+
+    def predict(self, X_new):
+        n_new = X_new.shape[0]
+        sim_pred = self.sim(X_new, np.full((n_new, 1), self.current_theta))
+        if self._gp_L is None or self._gp_X is None:
+            return sim_pred, np.full(n_new, self.sigma2)
+        k_star = self.sv * np.exp(-0.5 * cdist(X_new, self._gp_X, metric="sqeuclidean") / self.ls ** 2)
+        gp_mu = k_star @ self._gp_alpha
+        v = np.linalg.solve(self._gp_L, k_star.T)
+        gp_var = np.maximum(self.sv + self.sigma2 - np.sum(v ** 2, axis=0), 1e-8)
+        return sim_pred + gp_mu, gp_var
+
+    def update_batch(self, Xb_np, Yb_np):
+        self.X_buf.append(Xb_np.copy())
+        self.Y_buf.append(Yb_np.copy())
+        X_all = np.concatenate(self.X_buf, axis=0)
+        Y_all = np.concatenate(self.Y_buf, axis=0)
+        if len(X_all) > self.W:
+            X_all, Y_all = X_all[-self.W:], Y_all[-self.W:]
+            self.X_buf, self.Y_buf = [X_all], [Y_all]
+        n = len(X_all)
+        if n < 5:
+            return
+        dist_sq = cdist(X_all, X_all, metric="sqeuclidean")
+        K = self.sv * np.exp(-0.5 * dist_sq / self.ls ** 2) + self.sigma2 * np.eye(n) + 1e-6 * np.eye(n)
+        try:
+            L = np.linalg.cholesky(K)
+        except np.linalg.LinAlgError:
+            K += 1e-4 * np.eye(n)
+            try:
+                L = np.linalg.cholesky(K)
+            except np.linalg.LinAlgError:
+                return
+        logdet = 2.0 * np.sum(np.log(np.diag(L)))
+        const = n * np.log(2.0 * np.pi)
+        log_ml = np.empty(len(self.theta_grid))
+        for i, th in enumerate(self.theta_grid):
+            ys = self.sim(X_all, np.full((n, 1), th))
+            r = Y_all - ys
+            alpha = np.linalg.solve(L, r)
+            log_ml[i] = -0.5 * (np.dot(alpha, alpha) + logdet + const)
+        w = np.exp(log_ml - logsumexp(log_ml))
+        self.current_theta = float(np.sum(w * self.theta_grid))
+        self._fit_prediction_gp(X_all, Y_all)
+
+    def mean_theta(self):
+        return self.current_theta
+
+
 # -------------------------------------------------------------
 # Aggregate OGP-BOCPD particles across experts (mass-weighted)
 # -------------------------------------------------------------
@@ -383,6 +600,7 @@ def run_one_slope(
         cand_rl_hist = []
 
         top0_particles_hist = []
+        restart_mode_hist = []
 
         if mode == 0:
             stream2 = SlopeDriftDataStream(
@@ -628,6 +846,11 @@ def run_one_slope(
             cfg = CalibrationConfig()
             cfg.bocpd.bocpd_mode = meta["mode"]
             cfg.bocpd.use_restart = True
+            # Keep backward compatibility by default; only enable hybrid when requested in methods.
+            cfg.bocpd.restart_impl = meta.get("restart_impl", "debug_260115")
+            cfg.bocpd.hybrid_partial_restart = bool(meta.get("hybrid_partial_restart", True))
+            cfg.bocpd.hybrid_tau_delta = float(meta.get("hybrid_tau_delta", 0.05))
+            cfg.bocpd.hybrid_tau_theta = float(meta.get("hybrid_tau_theta", 0.05))
             roll = RollingStats(window=50)
 
             if meta["mode"] == "restart":
@@ -672,6 +895,10 @@ def run_one_slope(
                     # )
 
                 rec = calib.step_batch(Xb, Yb, verbose=False)
+                rm = rec.get("restart_mode", None)
+                if rm is None:
+                    rm = "full" if bool(rec.get("did_restart", False)) else "none"
+                restart_mode_hist.append(rm)
 
                 dll = rec.get("delta_ll_pair", None)
                 if dll is not None and np.isfinite(dll):
@@ -772,7 +999,7 @@ def run_one_slope(
                     mu_t, var_t = torch.tensor(mu_np, dtype=Yb.dtype, device=Yb.device), torch.tensor(var_np, dtype=Yb.dtype, device=Yb.device) 
                     rmse_hist.append(float(torch.sqrt(((mu_t - Yb) ** 2).mean())))
                     crps_sim = crps_gaussian(mu_t, var_t, Yb)
-                    crps_hist.append(crps_sim.item())
+                    crps_hist.append(crps_sim.mean().item())
                     # print("bpc crps sim:", crps_sim)
 
                 X_all, y_all = X_hist, y_hist
@@ -832,7 +1059,7 @@ def run_one_slope(
                     mu_t, var_t = torch.tensor(mu, dtype=Yb.dtype, device=Yb.device), torch.tensor(var, dtype=Yb.dtype, device=Yb.device)
                     rmse_hist.append(float(torch.sqrt(((mu_t - Yb) ** 2).mean())))
                     crps_sim = crps_gaussian(mu_t, var_t, Yb)
-                    crps_hist.append(crps_sim.item())
+                    crps_hist.append(crps_sim.mean().item())
                     # print("bocpd-bpc crps sim:", crps_sim)
                 info = calib.step_batch(Xb.detach().cpu().numpy(), Yb.detach().cpu().numpy())
 
@@ -870,6 +1097,75 @@ def run_one_slope(
                 top0_particles_hist.append(batch_dict)
                 # print(theta_mean, theta_var[0], theta_lo, theta_hi)
 
+        # ---------- DA (PF + GP prediction) ----------
+        elif name == "DA":
+            da = PFWithGPPrediction(
+                sim_func_np=computer_model_config2_np,
+                n_particles=1024, theta_lo=0.0, theta_hi=3.0,
+                sigma_obs=0.2, resample_ess_ratio=0.5,
+                theta_move_std=0.05, window_size=80,
+                gp_lengthscale=0.3, gp_signal_var=1.0, seed=seed,
+            )
+            from tqdm import tqdm
+            pbar = tqdm(total=total_T, desc=name, unit="obs")
+            while total_obs < total_T:
+                Xb, Yb = stream2.next()
+                Xb_np, Yb_np = Xb.numpy(), Yb.numpy()
+
+                if total_obs > 0:
+                    mu_pred, var_pred = da.predict(Xb_np)
+                    mu_t = torch.tensor(mu_pred, dtype=Yb.dtype)
+                    var_t = torch.tensor(var_pred, dtype=Yb.dtype)
+                    rmse_hist.append(float(torch.sqrt(((mu_t - Yb) ** 2).mean())))
+                    crps = crps_gaussian(mu_t, var_t, Yb).mean()
+                    crps_hist.append(crps.item())
+
+                da.update_batch(Xb_np, Yb_np)
+                theta_hist.append(da.mean_theta())
+
+                top0_particles_hist.append(dict(
+                    particles=[torch.tensor(da.theta.copy())],
+                    weights=[torch.tensor(np.exp(da.logw.copy()))],
+                    log_mass=torch.tensor([0.0]),
+                ))
+                others_hist.append({"did_restart": False, "var": 0.0})
+                total_obs += batch_size
+                pbar.update(batch_size)
+            pbar.close()
+
+        # ---------- BC (KOH Sliding Window) ----------
+        elif name == "BC":
+            bc_theta_grid = np.linspace(0.0, 3.0, 200)
+            bc = KOHSlidingWindow(
+                sim_func_np=computer_model_config2_np,
+                theta_grid=bc_theta_grid, window_size=80,
+                sigma_obs=0.2, gp_lengthscale=0.3, gp_signal_var=1.0,
+            )
+            from tqdm import tqdm
+            pbar = tqdm(total=total_T, desc=name, unit="obs")
+            while total_obs < total_T:
+                Xb, Yb = stream2.next()
+                Xb_np, Yb_np = Xb.numpy(), Yb.numpy()
+
+                if total_obs > 0:
+                    mu_pred, var_pred = bc.predict(Xb_np)
+                    mu_t = torch.tensor(mu_pred, dtype=Yb.dtype)
+                    var_t = torch.tensor(var_pred, dtype=Yb.dtype)
+                    rmse_hist.append(float(torch.sqrt(((mu_t - Yb) ** 2).mean())))
+                    crps = crps_gaussian(mu_t, var_t, Yb).mean()
+                    crps_hist.append(crps.item())
+
+                bc.update_batch(Xb_np, Yb_np)
+                theta_hist.append(bc.mean_theta())
+
+                top0_particles_hist.append(dict(
+                    particles=[], weights=[], log_mass=torch.tensor([0.0]),
+                ))
+                others_hist.append({"did_restart": False, "var": 0.0})
+                total_obs += batch_size
+                pbar.update(batch_size)
+            pbar.close()
+
         # ---------- oracle ----------
         phi_hist = stream2.phi_history[: len(theta_hist)]
         oracle_hist = [
@@ -896,6 +1192,7 @@ def run_one_slope(
                     anchor_rl_hist=np.array(anchor_rl_hist),
                     cand_rl_hist=np.array(cand_rl_hist),
                     crps_hist=np.array(crps_hist),
+                    restart_mode_hist=restart_mode_hist,
                 )
         else:
             results[name] = dict(
@@ -963,14 +1260,26 @@ def main():
         phi2_of_theta = None
 
     methods = {
+        # "DA": dict(type="da"),
+        # "BC": dict(type="bc"),
         # "BPC-80": dict(type="bpc"),
         # "BOCPD-BPC": dict(type="bpc_bocpd"),
         # "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
         # "PF-OGP": dict(type="pf_ogp"),
         # "BOCPD-PF": dict(type="bocpd", mode="standard"),
-        "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True, bocpd_use_discrepancy=True),
-        "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
+        # "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True, bocpd_use_discrepancy=True),
+        # "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
         "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
+        "R-BOCPD-PF-halfdiscrepancy-hybrid": dict(
+            type="bocpd",
+            mode="restart",
+            use_discrepancy=False,
+            bocpd_use_discrepancy=True,
+            restart_impl="hybrid_260319",
+            hybrid_partial_restart=True,
+            hybrid_tau_delta=0.05,
+            hybrid_tau_theta=0.05,
+        ),
     }
 
     all_results = {}
@@ -1003,6 +1312,7 @@ def main():
 
     # ========== 收集所有组合的 metrics ==========
     all_metrics = []
+    restart_mode_rows = []
 
     for s, batch_size, seed in itertools.product(slopes, batch_sizes, seeds):
         # 从 all_results 获取对应的 res
@@ -1028,11 +1338,66 @@ def main():
                 "y_crps": y_crps_mean,
             })
 
+            if "restart_mode_hist" in data:
+                rm = data["restart_mode_hist"]
+                n = max(len(rm), 1)
+                n_none = sum(1 for v in rm if v == "none")
+                n_delta = sum(1 for v in rm if v == "delta_only")
+                n_full = sum(1 for v in rm if v not in ("none", "delta_only"))
+                restart_mode_rows.append({
+                    "method": method_name,
+                    "slope": s,
+                    "batch_size": batch_size,
+                    "seed": seed,
+                    "n_steps": len(rm),
+                    "none_ratio": n_none / n,
+                    "delta_only_ratio": n_delta / n,
+                    "full_ratio": n_full / n,
+                    "n_none": n_none,
+                    "n_delta_only": n_delta,
+                    "n_full": n_full,
+                })
+
     # 转换为 DataFrame 并保存
     import pandas as pd
     df_metrics = pd.DataFrame(all_metrics)
     df_metrics.to_csv(f"{store_dir}/all_metrics.csv", index=False)
     df_metrics.to_excel(f"{store_dir}/all_metrics.xlsx", index=False)
+
+    if len(restart_mode_rows) > 0:
+        df_restart = pd.DataFrame(restart_mode_rows)
+        df_restart.to_csv(f"{store_dir}/restart_mode_stats.csv", index=False)
+        df_restart.to_excel(f"{store_dir}/restart_mode_stats.xlsx", index=False)
+
+        # aggregated plot: by method and slope, averaged across seeds/batch sizes
+        df_plot = (
+            df_restart.groupby(["method", "slope"], as_index=False)[
+                ["none_ratio", "delta_only_ratio", "full_ratio"]
+            ]
+            .mean()
+            .sort_values(["method", "slope"])
+        )
+        for method in df_plot["method"].unique():
+            sub = df_plot[df_plot["method"] == method].copy()
+            x = np.arange(len(sub))
+            plt.figure(figsize=(9, 4.8))
+            plt.stackplot(
+                x,
+                sub["none_ratio"].values,
+                sub["delta_only_ratio"].values,
+                sub["full_ratio"].values,
+                labels=["none", "delta_only", "full"],
+                alpha=0.9,
+            )
+            plt.xticks(x, [f"{v:.4g}" for v in sub["slope"].values], rotation=0)
+            plt.ylim(0.0, 1.0)
+            plt.xlabel("slope")
+            plt.ylabel("ratio")
+            plt.title(f"Restart mode ratio vs slope ({method})")
+            plt.legend(loc="upper right")
+            plt.tight_layout()
+            plt.savefig(f"{store_dir}/restart_mode_ratio_{method}.png", dpi=300)
+            plt.close()
 
     # ========== 打印每个 method 的平均 metrics ==========
     print("\n" + "="*70)

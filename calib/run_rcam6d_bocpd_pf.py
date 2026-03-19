@@ -853,7 +853,7 @@ python -m calib.run_rcam6d_bocpd_pf --plot_dir "figs/rcam6d_compare" --num_parti
 #   R-BOCPD-PF-nodiscrepancy    - 都不使用 discrepancy
 #   R-BOCPD-PF-halfdiscrepancy  - PF 不用，BOCPD 用 discrepancy
 
-python -m calib.run_rcam6d_bocpd_pf --plot_dir "figs/rcam6d_compare" --num_particles 1024 --max_steps 100 --normalize --run_all
+python -m calib.run_rcam6d_bocpd_pf --plot_dir "figs/rcam6d_compare" --num_particles 1024 --max_steps 1000 --normalize --run_all
 
 
 # 运行所有三种方法并比较（快速测试）
