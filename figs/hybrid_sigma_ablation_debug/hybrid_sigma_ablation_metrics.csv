@@ -1,0 +1,7 @@
+task,method,theta_rmse,y_rmse,y_crps,n_steps,n_none,n_delta_only,n_full,restart_rate,delta_ratio_given_restart,full_ratio_given_restart,slope,batch_size,seed,seg_len_L,delta_mag
+slope,R-BOCPD-PF-halfdiscrepancy-hybrid-fixed,0.024947433382954524,0.3095988114747165,0.17971375273478377,20,18,2,0,0.1,1.0,0.0,0.001,10,456,,
+slope,R-BOCPD-PF-halfdiscrepancy-hybrid-var_only,0.024155912898412967,0.3101100163534237,0.17968229329643537,20,18,1,1,0.1,0.5,0.5,0.001,10,456,,
+slope,R-BOCPD-PF-halfdiscrepancy-hybrid-rolled,0.02287479926717609,0.3065745987313056,0.17878738528445268,20,18,2,0,0.1,1.0,0.0,0.001,10,456,,
+sudden,R-BOCPD-PF-halfdiscrepancy-hybrid-fixed,0.024078604127803546,1.7071807022170815,0.5804947367542016,24,22,0,2,0.08333333333333333,0.0,1.0,,20,456,120.0,2.0
+sudden,R-BOCPD-PF-halfdiscrepancy-hybrid-var_only,0.014519691037153967,1.7055338555651611,0.34994785131418066,24,21,0,3,0.125,0.0,1.0,,20,456,120.0,2.0
+sudden,R-BOCPD-PF-halfdiscrepancy-hybrid-rolled,0.01451189932542489,1.7074918086466162,0.3499892136806759,24,21,0,3,0.125,0.0,1.0,,20,456,120.0,2.0

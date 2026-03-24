@@ -44,6 +44,58 @@ class BOCPD(BaseBOCPD):
         logmix = torch.logsumexp(ps.logw.view(1, -1) + loglik, dim=1)
         return float(logmix.mean().item())
 
+    def _sigma_mode(self) -> str:
+        return str(getattr(self.config, "hybrid_pf_sigma_mode", "fixed")).lower()
+
+    def _sigma_bounds(self):
+        smin = float(getattr(self.config, "hybrid_sigma_min", 1e-4))
+        smax = float(getattr(self.config, "hybrid_sigma_max", 10.0))
+        if smax < smin:
+            smax = smin
+        return smin, smax
+
+    def _sigma_eff_var_only(self, e: Expert, X_batch: torch.Tensor, model_cfg: ModelConfig) -> float:
+        base_var = float(model_cfg.sigma_eps ** 2)
+        alpha = float(getattr(self.config, "hybrid_sigma_delta_alpha", 1.0))
+        delta_var_mean = 0.0
+        if e.delta_state is not None:
+            try:
+                _, var_delta = e.delta_state.predict(X_batch)
+                delta_var_mean = float(torch.clamp(var_delta.reshape(-1).mean(), min=0.0).item())
+            except Exception:
+                delta_var_mean = 0.0
+        sigma2 = base_var + alpha * delta_var_mean
+        smin, smax = self._sigma_bounds()
+        sigma = math.sqrt(max(min(sigma2, smax * smax), smin * smin))
+        return float(sigma)
+
+    def _sigma_eff_rolled(self, e: Expert, X_batch: torch.Tensor, Y_batch: torch.Tensor, emulator: Emulator, model_cfg: ModelConfig) -> float:
+        if not hasattr(self, "_rolled_sigma2"):
+            self._rolled_sigma2 = {}
+        key = id(e)
+        beta = float(getattr(self.config, "hybrid_sigma_ema_beta", 0.98))
+        beta = max(min(beta, 0.9999), 0.0)
+
+        mu_eta_all, _ = emulator.predict(X_batch, e.pf.particles.theta)
+        w = e.pf.particles.weights().view(1, -1)
+        if mu_eta_all.dim() == 2:
+            eta_mix = (w * mu_eta_all).sum(dim=1)
+        else:
+            eta_mix = (w.unsqueeze(-1) * mu_eta_all).sum(dim=1)
+        yhat = model_cfg.rho * eta_mix
+        resid = Y_batch - yhat
+        if resid.dim() > 1:
+            resid = resid.mean(dim=-1)
+        r2 = float(torch.clamp(resid.reshape(-1).pow(2).mean(), min=0.0).item())
+
+        prev = float(self._rolled_sigma2.get(key, model_cfg.sigma_eps ** 2))
+        cur = beta * prev + (1.0 - beta) * r2
+        self._rolled_sigma2[key] = cur
+
+        smin, smax = self._sigma_bounds()
+        sigma = math.sqrt(max(min(cur, smax * smax), smin * smin))
+        return float(sigma)
+
     def _reset_delta_for_expert(self, e: Expert, model_cfg: ModelConfig) -> None:
         if e.X_hist.numel() == 0:
             e.delta_state = None
@@ -331,16 +383,28 @@ class BOCPD(BaseBOCPD):
 
         pf_diags = []
         for e in self.experts:
+            sigma_eff = float(model_cfg.sigma_eps)
+            use_discrepancy_pf = bool(getattr(model_cfg, "use_discrepancy", True))
+            mode = self._sigma_mode()
+            if mode == "var_only":
+                sigma_eff = self._sigma_eff_var_only(e, X_batch, model_cfg)
+                use_discrepancy_pf = False
+            elif mode == "rolled":
+                sigma_eff = self._sigma_eff_rolled(e, X_batch, Y_batch, emulator, model_cfg)
+                use_discrepancy_pf = False
+
             diag = e.pf.step_batch(
                 X_batch,
                 Y_batch,
                 emulator,
                 e.delta_state,
                 model_cfg.rho,
-                model_cfg.sigma_eps,
+                sigma_eff,
                 grad_info=False,
-                use_discrepancy=model_cfg.use_discrepancy,
+                use_discrepancy=use_discrepancy_pf,
             )
+            diag["sigma_eff"] = float(sigma_eff)
+            diag["sigma_mode"] = mode
             pf_diags.append(diag)
             if not getattr(model_cfg, "refit_delta_every_batch", True):
                 continue

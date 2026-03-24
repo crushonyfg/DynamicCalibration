@@ -707,6 +707,13 @@ def run_one_sudden(
             cfg.bocpd.hybrid_partial_restart = bool(meta.get("hybrid_partial_restart", True))
             cfg.bocpd.hybrid_tau_delta = float(meta.get("hybrid_tau_delta", 0.05))
             cfg.bocpd.hybrid_tau_theta = float(meta.get("hybrid_tau_theta", 0.05))
+            cfg.bocpd.hybrid_tau_full = float(meta.get("hybrid_tau_full", 0.05))
+            cfg.bocpd.hybrid_delta_share_rho = float(meta.get("hybrid_delta_share_rho", 0.75))
+            cfg.bocpd.hybrid_pf_sigma_mode = str(meta.get("hybrid_pf_sigma_mode", "fixed"))
+            cfg.bocpd.hybrid_sigma_delta_alpha = float(meta.get("hybrid_sigma_delta_alpha", 1.0))
+            cfg.bocpd.hybrid_sigma_ema_beta = float(meta.get("hybrid_sigma_ema_beta", 0.98))
+            cfg.bocpd.hybrid_sigma_min = float(meta.get("hybrid_sigma_min", 1e-4))
+            cfg.bocpd.hybrid_sigma_max = float(meta.get("hybrid_sigma_max", 10.0))
 
             if meta["mode"] == "restart":
                 cfg.model.use_discrepancy = meta["use_discrepancy"]
@@ -730,12 +737,12 @@ def run_one_sudden(
                     pred_comp = calib.predict_complete(Xb, Yb)
                     report_sub_hist = (pred_comp["crps_sim"].item(),pred_comp["experts_logpred"],pred_comp["var_sim"])
                     # print(name, total_obs, report_hist[-1])
-                    # rmse_hist.append(
-                    #     float(torch.sqrt(((pred["mu"] - Yb) ** 2).mean()))
-                    # )
                     rmse_hist.append(
-                        float(torch.sqrt(((pred["mu_sim"] - Yb) ** 2).mean()))
+                        float(torch.sqrt(((pred["mu"] - Yb) ** 2).mean()))
                     )
+                    # rmse_hist.append(
+                    #     float(torch.sqrt(((pred["mu_sim"] - Yb) ** 2).mean()))
+                    # )
                     crps = crps_gaussian(pred["mu"], pred["var"], Yb).mean()
                     # print(crps)
                     crps_hist.append(crps.item())
@@ -865,7 +872,7 @@ def run_one_sudden(
                     y_hist = y_hist[-W:]
 
                 if total_obs > 0 and bpc is not None:
-                    mu_np, var_np = bpc.predict_sim(Xb.detach().cpu().numpy())
+                    mu_np, var_np = bpc.predict(Xb.detach().cpu().numpy())
                     mu_t, var_t = torch.tensor(mu_np, dtype=Yb.dtype, device=Yb.device), torch.tensor(var_np, dtype=Yb.dtype, device=Yb.device) 
                     rmse_hist.append(float(torch.sqrt(((mu_t - Yb) ** 2).mean())))
                     crps_sim = crps_gaussian(mu_t, var_t, Yb)
@@ -928,7 +935,7 @@ def run_one_sudden(
                 crps_sim = None
 
                 if total_obs > 0:
-                    mu, var = calib.predict_sim(Xb)
+                    mu, var = calib.predict(Xb)
                     mu_t, var_t = torch.tensor(mu, dtype=Yb.dtype, device=Yb.device), torch.tensor(var, dtype=Yb.dtype, device=Yb.device)
                     rmse_hist.append(float(torch.sqrt(((mu_t - Yb) ** 2).mean())))
                     crps_sim = crps_gaussian(mu_t, var_t, Yb)
@@ -1142,8 +1149,8 @@ def main():
         seg_lens = [120]
         magnitudes = [2.0] 
     else:
-        magnitudes = [0.5, 1.0, 2.0, 3.0, 5.0]
-        seeds = [101, 202, 303, 404, 505]               # you can add more
+        magnitudes = [0.5, 1.0, 2.0, 3.0]
+        seeds = [101, 202, 303]               # you can add more
         batch_sizes = [20]      # you can add more
 
         # frequency: segment length L in observation-time units
@@ -1154,15 +1161,25 @@ def main():
     methods = {
         # "DA": dict(type="da"),
         # "BC": dict(type="bc"),
-        # "BOCPD-PF": dict(type="bocpd", mode="standard"),
+        "BOCPD-PF": dict(type="bocpd", mode="standard"),
         # "BPC-80": dict(type="bpc"),
         # "BOCPD-BPC": dict(type="bpc_bocpd"),
         # "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
         # "PF-OGP": dict(type="pf_ogp"),
-        # "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
-        # "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
-        "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
-        "R-BOCPD-PF-halfdiscrepancy-hybrid": dict(
+        "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
+        "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
+        # "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
+        # "R-BOCPD-PF-halfdiscrepancy-hybrid": dict(
+        #     type="bocpd",
+        #     mode="restart",
+        #     use_discrepancy=False,
+        #     bocpd_use_discrepancy=True,
+        #     restart_impl="hybrid_260319",
+        #     hybrid_partial_restart=True,
+        #     hybrid_tau_delta=0.05,
+        #     hybrid_tau_theta=0.05,
+        # ),
+        "R-BOCPD-PF-halfdiscrepancy-hybrid-rolled": dict(
             type="bocpd",
             mode="restart",
             use_discrepancy=False,
@@ -1171,6 +1188,13 @@ def main():
             hybrid_partial_restart=True,
             hybrid_tau_delta=0.05,
             hybrid_tau_theta=0.05,
+            hybrid_tau_full=0.05,
+            hybrid_delta_share_rho=0.75,
+            hybrid_pf_sigma_mode="rolled",
+            hybrid_sigma_delta_alpha=1.0,
+            hybrid_sigma_ema_beta=0.98,
+            hybrid_sigma_min=1e-4,
+            hybrid_sigma_max=10.0,
         ),
         # "BPC-80": dict(type="bpc"),
     }

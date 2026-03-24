@@ -847,9 +847,9 @@ if __name__ == "__main__":
         "R-BOCPD-PF-OGP": dict(type="ogp_bocpd"),
         # "PF-OGP": dict(type="pf_ogp"),
         # "BOCPD-PF": dict(type="bocpd", mode="standard"),
-        "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
-        "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False),
-        "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
+        # "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
+        # "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False),
+        # "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
         # "BPC-80": dict(type="bpc"),
     }
     all_results = {}

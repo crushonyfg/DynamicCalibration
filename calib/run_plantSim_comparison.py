@@ -58,6 +58,24 @@ from .run_plantSim_v3_std import (
 )
 
 
+def _rmse(arr_err: np.ndarray) -> float:
+    arr = np.asarray(arr_err, dtype=float)
+    if arr.size == 0:
+        return float("nan")
+    return float(np.sqrt(np.mean(arr ** 2)))
+
+
+def _crps_simple(mu: np.ndarray, y: np.ndarray) -> float:
+    """
+    Simplified CRPS for scalar targets: use MAE surrogate.
+    """
+    mu = np.asarray(mu, dtype=float).reshape(-1)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    if mu.size == 0 or y.size == 0:
+        return float("nan")
+    return float(np.mean(np.abs(mu - y)))
+
+
 # =====================================================================
 # DA : PF-NoDiscrepancy  (标准化空间, NN emulator)
 # =====================================================================
@@ -322,6 +340,7 @@ def main():
     }
 
     all_results: Dict[int, dict] = {}
+    metrics_rows: List[dict] = []
 
     for mode in args.modes:
         mode_label = MODE_NAMES.get(mode, f"mode {mode}")
@@ -348,6 +367,7 @@ def main():
 
         stream_da = _make_stream(mode, args.data_dir, args.csv)
         da_theta, da_gt = [], []
+        da_y_pred_all, da_y_true_all = [], []
         for Xb, yb, thb in tqdm(
             _iter_batches(stream_da, batch_size), desc="  DA  "
         ):
@@ -356,8 +376,18 @@ def main():
 
             pf.update_batch(newX, newY)
             mean_raw = gt_tf.theta_s_to_raw(pf.mean_theta_s())
-            da_theta.append(float(mean_raw))
+            # print(mean_raw)
+            da_theta.append(float(mean_raw.item()))
             da_gt.append(float(np.mean(thb)))
+
+            # y prediction (raw space) with current theta estimate
+            th_s = pf.mean_theta_s()
+            th_t = torch.tensor([[th_s]], dtype=torch.float64)
+            mu_s, _ = emu.predict(newX, th_t)  # [B,1] or [B]
+            mu_s = mu_s.reshape(-1).detach().cpu().numpy()
+            mu_raw = gt_tf.y_s_to_raw(mu_s)
+            da_y_pred_all.append(mu_raw.reshape(-1))
+            da_y_true_all.append(np.asarray(yb, dtype=float).reshape(-1))
         print(f"  DA   done in {timer() - t0:.1f}s  ({len(da_theta)} batches)")
 
         # ============================================================
@@ -378,6 +408,7 @@ def main():
 
         stream_bc = _make_stream(mode, args.data_dir, args.csv)
         bc_theta, bc_gt = [], []
+        bc_y_pred_all, bc_y_true_all = [], []
         for Xb, yb, thb in tqdm(
             _iter_batches(stream_bc, batch_size), desc="  BC  "
         ):
@@ -386,8 +417,13 @@ def main():
             koh.update_batch(Xb_s, Yb_s)
 
             mean_raw = gt_tf.theta_s_to_raw(koh.mean_theta_s())
-            bc_theta.append(float(mean_raw))
+            bc_theta.append(float(mean_raw.item()))
             bc_gt.append(float(np.mean(thb)))
+
+            mu_s = koh._nn_predict(Xb_s, koh.mean_theta_s())  # [B]
+            mu_raw = gt_tf.y_s_to_raw(mu_s)
+            bc_y_pred_all.append(np.asarray(mu_raw, dtype=float).reshape(-1))
+            bc_y_true_all.append(np.asarray(yb, dtype=float).reshape(-1))
         print(f"  BC   done in {timer() - t0:.1f}s  ({len(bc_theta)} batches)")
 
         # ============================================================
@@ -408,6 +444,7 @@ def main():
 
         stream_ours = _make_stream(mode, args.data_dir, args.csv)
         ours_theta, ours_gt = [], []
+        ours_y_pred_all, ours_y_true_all = [], []
         for Xb, yb, thb in tqdm(
             _iter_batches(stream_ours, batch_size), desc="  Ours"
         ):
@@ -415,11 +452,18 @@ def main():
             newY = batch_y_to_s(gt_tf, yb)
 
             calib.step_batch(newX, newY, verbose=False)
+            pred = calib.predict_batch(newX)
 
             mean_theta_s, var_theta_s, lo_s, hi_s = calib._aggregate_particles(0.9)
             mean_raw = gt_tf.theta_s_to_raw(float(mean_theta_s[0]))
-            ours_theta.append(float(mean_raw))
+            ours_theta.append(float(mean_raw.item()))
             ours_gt.append(float(np.mean(thb)))
+
+            mu_s = pred.get("mu_sim", pred.get("mu"))
+            mu_s = mu_s.detach().cpu().numpy().reshape(-1)
+            mu_raw = gt_tf.y_s_to_raw(mu_s)
+            ours_y_pred_all.append(np.asarray(mu_raw, dtype=float).reshape(-1))
+            ours_y_true_all.append(np.asarray(yb, dtype=float).reshape(-1))
         print(f"  Ours done in {timer() - t0:.1f}s  ({len(ours_theta)} batches)")
 
         # ---- 汇总该 mode 的结果 ----
@@ -437,6 +481,43 @@ def main():
         for lbl in ["DA", "BC", "Ours"]:
             rmse = np.sqrt(np.mean((all_results[mode][lbl] - gt_arr) ** 2))
             print(f"    {lbl:>5s}  θ-RMSE = {rmse:.4f}")
+
+        # ---- per-mode metrics (theta rmse/crps, y rmse/crps) ----
+        method_y_data = {
+            "DA": (da_y_pred_all, da_y_true_all),
+            "BC": (bc_y_pred_all, bc_y_true_all),
+            "Ours": (ours_y_pred_all, ours_y_true_all),
+        }
+        for lbl in ["DA", "BC", "Ours"]:
+            theta_hat = np.asarray(all_results[mode][lbl], dtype=float)
+            theta_true = np.asarray(gt_arr, dtype=float)
+            theta_err = theta_hat - theta_true
+            theta_rmse = _rmse(theta_err)
+            theta_crps = _crps_simple(theta_hat, theta_true)
+
+            y_pred_batches, y_true_batches = method_y_data[lbl]
+            if len(y_pred_batches) > 0:
+                y_pred = np.concatenate(y_pred_batches, axis=0)
+                y_true = np.concatenate(y_true_batches, axis=0)
+                y_err = y_pred - y_true
+                y_rmse = _rmse(y_err)
+                y_crps = _crps_simple(y_pred, y_true)
+            else:
+                y_rmse, y_crps = float("nan"), float("nan")
+
+            metrics_rows.append(
+                dict(
+                    mode=mode,
+                    mode_name=mode_label,
+                    method=lbl,
+                    theta_rmse=theta_rmse,
+                    theta_crps=theta_crps,
+                    y_rmse=y_rmse,
+                    y_crps=y_crps,
+                    n_theta=len(theta_hat),
+                    n_y=len(np.concatenate(y_true_batches, axis=0)) if len(y_true_batches) > 0 else 0,
+                )
+            )
 
         # ---- 保存 theta 估计日志 (CSV) ----
         log_path = os.path.join(out_dir, f"theta_log_mode{mode}.csv")
@@ -482,6 +563,30 @@ def main():
     results_path = os.path.join(out_dir, "comparison_results.pt")
     torch.save(all_results, results_path)
     print(f"[Saved] Results → {results_path}")
+
+    # ---- 保存 metrics summary ----
+    metrics_csv = os.path.join(out_dir, "metrics_summary.csv")
+    with open(metrics_csv, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "mode", "mode_name", "method",
+                "theta_rmse", "theta_crps", "y_rmse", "y_crps",
+                "n_theta", "n_y",
+            ],
+        )
+        writer.writeheader()
+        for row in metrics_rows:
+            writer.writerow(row)
+    print(f"[Saved] Metrics → {metrics_csv}")
+
+    print("\nMetrics Summary:")
+    for row in metrics_rows:
+        print(
+            f"  mode={row['mode']} {row['method']:>5s} | "
+            f"theta_rmse={row['theta_rmse']:.4f}, theta_crps={row['theta_crps']:.4f}, "
+            f"y_rmse={row['y_rmse']:.4f}, y_crps={row['y_crps']:.4f}"
+        )
     print("\nAll done!")
 
 

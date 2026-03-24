@@ -851,6 +851,13 @@ def run_one_slope(
             cfg.bocpd.hybrid_partial_restart = bool(meta.get("hybrid_partial_restart", True))
             cfg.bocpd.hybrid_tau_delta = float(meta.get("hybrid_tau_delta", 0.05))
             cfg.bocpd.hybrid_tau_theta = float(meta.get("hybrid_tau_theta", 0.05))
+            cfg.bocpd.hybrid_tau_full = float(meta.get("hybrid_tau_full", 0.05))
+            cfg.bocpd.hybrid_delta_share_rho = float(meta.get("hybrid_delta_share_rho", 0.75))
+            cfg.bocpd.hybrid_pf_sigma_mode = str(meta.get("hybrid_pf_sigma_mode", "fixed"))
+            cfg.bocpd.hybrid_sigma_delta_alpha = float(meta.get("hybrid_sigma_delta_alpha", 1.0))
+            cfg.bocpd.hybrid_sigma_ema_beta = float(meta.get("hybrid_sigma_ema_beta", 0.98))
+            cfg.bocpd.hybrid_sigma_min = float(meta.get("hybrid_sigma_min", 1e-4))
+            cfg.bocpd.hybrid_sigma_max = float(meta.get("hybrid_sigma_max", 10.0))
             roll = RollingStats(window=50)
 
             if meta["mode"] == "restart":
