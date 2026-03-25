@@ -97,6 +97,8 @@ class OnlineBayesCalibrator:
             restart_impl = str(getattr(calib_cfg.bocpd, "restart_impl", "debug_260115")).lower()
             if restart_impl in {"hybrid", "hybrid_260319"}:
                 from .restart_bocpd_hybrid_260319_gpytorch import BOCPD as RestartBOCPDImpl
+            elif restart_impl in {"cusum", "rolled_cusum", "rolled_cusum_260324", "hybrid_cusum_260324"}:
+                from .restart_bocpd_rolled_cusum_260324_gpytorch import BOCPD as RestartBOCPDImpl
             else:
                 RestartBOCPDImpl = RestartBOCPD
             # 使用 R-BOCPD 实现（restart_bocpd.py）
@@ -417,3 +419,4 @@ class OnlineBayesCalibrator:
         if dy == 1:
             mix_mu, mix_var = mix_mu.squeeze(0), mix_var.squeeze(0)
         return {"mu": mix_mu, "var": mix_var}
+

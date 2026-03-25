@@ -758,9 +758,28 @@ def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
             cfg = CalibrationConfig()
             cfg.bocpd.bocpd_mode = meta["mode"]
             cfg.bocpd.use_restart = True
+            cfg.bocpd.restart_impl = meta.get("restart_impl", "debug_260115")
+            cfg.bocpd.hybrid_partial_restart = bool(meta.get("use_dual_restart", meta.get("hybrid_partial_restart", True)))
+            cfg.bocpd.hybrid_tau_delta = float(meta.get("hybrid_tau_delta", 0.05))
+            cfg.bocpd.hybrid_tau_theta = float(meta.get("hybrid_tau_theta", 0.05))
+            cfg.bocpd.hybrid_tau_full = float(meta.get("hybrid_tau_full", 0.05))
+            cfg.bocpd.hybrid_delta_share_rho = float(meta.get("hybrid_delta_share_rho", 0.75))
+            cfg.bocpd.hybrid_pf_sigma_mode = str(meta.get("hybrid_pf_sigma_mode", "fixed"))
+            cfg.bocpd.hybrid_sigma_delta_alpha = float(meta.get("hybrid_sigma_delta_alpha", 1.0))
+            cfg.bocpd.hybrid_sigma_ema_beta = float(meta.get("hybrid_sigma_ema_beta", 0.98))
+            cfg.bocpd.hybrid_sigma_min = float(meta.get("hybrid_sigma_min", 1e-4))
+            cfg.bocpd.hybrid_sigma_max = float(meta.get("hybrid_sigma_max", 10.0))
+            cfg.bocpd.use_cusum = bool(meta.get("use_cusum", False))
+            cfg.bocpd.cusum_threshold = float(meta.get("cusum_threshold", 10.0))
+            cfg.bocpd.cusum_recent_obs = int(meta.get("cusum_recent_obs", 20))
+            cfg.bocpd.cusum_cov_eps = float(meta.get("cusum_cov_eps", 1e-6))
+            cfg.bocpd.cusum_mode = str(meta.get("cusum_mode", "cumulative"))
+            cfg.bocpd.standardized_gate_threshold = float(meta.get("standardized_gate_threshold", 3.0))
+            cfg.bocpd.standardized_gate_consecutive = int(meta.get("standardized_gate_consecutive", 1))
 
             if meta["mode"] == "restart":
                 cfg.model.use_discrepancy = meta["use_discrepancy"]
+                cfg.model.bocpd_use_discrepancy = meta.get("bocpd_use_discrepancy", cfg.model.use_discrepancy)
 
             calib = OnlineBayesCalibrator(cfg, emulator, prior_sampler)
             for Xb, yb, thb in tqdm(batches(stream, batch_size), desc=f"Running {name}"):
@@ -845,6 +864,19 @@ if __name__ == "__main__":
         # "BPC-80": dict(type="bpc"),
         # "BOCPD-BPC": dict(type="bpc_bocpd"),
         "R-BOCPD-PF-OGP": dict(type="ogp_bocpd"),
+        "RBOCPD_half_STDGate": dict(
+            type="bocpd",
+            mode="restart",
+            use_discrepancy=False,
+            bocpd_use_discrepancy=True,
+            restart_impl="rolled_cusum_260324",
+            use_dual_restart=True,
+            use_cusum=True,
+            cusum_mode="standardized_gate",
+            standardized_gate_threshold=3.0,
+            standardized_gate_consecutive=1,
+            cusum_recent_obs=20,
+        ),
         # "PF-OGP": dict(type="pf_ogp"),
         # "BOCPD-PF": dict(type="bocpd", mode="standard"),
         # "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
@@ -890,3 +922,4 @@ if __name__ == "__main__":
             plt.close()
 
         torch.save(all_results, f"{out_dir}/plantSim_results_mode{mode}.pt")
+
