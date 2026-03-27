@@ -43,7 +43,7 @@ warnings.filterwarnings("ignore")
 
 # ---- calib sub-package imports ----
 from .configs import CalibrationConfig
-from .online_calibrator import OnlineBayesCalibrator
+from .online_calibrator import OnlineBayesCalibrator, crps_gaussian
 from .v3_utils import StreamClass, JumpPlan
 
 # ---- from run_plantSim_v3_std (module-level code 已封装为函数, 导入安全) ----
@@ -67,13 +67,25 @@ def _rmse(arr_err: np.ndarray) -> float:
 
 def _crps_simple(mu: np.ndarray, y: np.ndarray) -> float:
     """
-    Simplified CRPS for scalar targets: use MAE surrogate.
+    Deterministic CRPS for point forecasts. For a degenerate predictive
+    distribution this reduces to mean absolute error.
     """
     mu = np.asarray(mu, dtype=float).reshape(-1)
     y = np.asarray(y, dtype=float).reshape(-1)
     if mu.size == 0 or y.size == 0:
         return float("nan")
     return float(np.mean(np.abs(mu - y)))
+
+
+def _gaussian_crps_mean(mu, var, y) -> float:
+    mu_t = torch.as_tensor(mu, dtype=torch.float64).detach().cpu()
+    var_t = torch.clamp(torch.as_tensor(var, dtype=torch.float64).detach().cpu(), min=1e-12)
+    y_t = torch.as_tensor(y, dtype=torch.float64).detach().cpu()
+    return float(crps_gaussian(mu_t, var_t, y_t).mean().item())
+
+
+def _default_sigma_eps_s() -> float:
+    return float(CalibrationConfig().model.sigma_eps)
 
 
 # =====================================================================
@@ -325,8 +337,9 @@ def main():
     gt_tf, nn_model, emu, a_s, b_s = init_pipeline(npz_path=args.npz)
 
     # sigma_obs 在标准化 y 空间
-    sigma_obs_s = float(gt_tf.y_scaler.scale_[0])
-    print(f"sigma_obs_s = {sigma_obs_s:.4f}")
+    sigma_obs_s = _default_sigma_eps_s()
+    print(f"sigma_obs_s = {sigma_obs_s:.4f} (standardized y-space)")
+    print(f"y_raw scale = {float(gt_tf.y_scaler.scale_[0]):.4f}")
     print(f"theta_s range: [{a_s:.3f}, {b_s:.3f}]")
     print(f"theta_raw range: [3.0, 21.0] minutes\n")
 
@@ -367,7 +380,7 @@ def main():
 
         stream_da = _make_stream(mode, args.data_dir, args.csv)
         da_theta, da_gt = [], []
-        da_y_pred_all, da_y_true_all = [], []
+        da_y_pred_all, da_y_var_all, da_y_true_all = [], [], []
         for Xb, yb, thb in tqdm(
             _iter_batches(stream_da, batch_size), desc="  DA  "
         ):
@@ -383,10 +396,13 @@ def main():
             # y prediction (raw space) with current theta estimate
             th_s = pf.mean_theta_s()
             th_t = torch.tensor([[th_s]], dtype=torch.float64)
-            mu_s, _ = emu.predict(newX, th_t)  # [B,1] or [B]
+            mu_s, var_s = emu.predict(newX, th_t)  # [B,1] or [B]
             mu_s = mu_s.reshape(-1).detach().cpu().numpy()
+            var_s = var_s.reshape(-1).detach().cpu().numpy()
             mu_raw = gt_tf.y_s_to_raw(mu_s)
-            da_y_pred_all.append(mu_raw.reshape(-1))
+            var_raw = np.clip(var_s, 1e-12, None) * (float(gt_tf.y_scaler.scale_[0]) ** 2)
+            da_y_pred_all.append(np.asarray(mu_raw, dtype=float).reshape(-1))
+            da_y_var_all.append(np.asarray(var_raw, dtype=float).reshape(-1))
             da_y_true_all.append(np.asarray(yb, dtype=float).reshape(-1))
         print(f"  DA   done in {timer() - t0:.1f}s  ({len(da_theta)} batches)")
 
@@ -408,7 +424,7 @@ def main():
 
         stream_bc = _make_stream(mode, args.data_dir, args.csv)
         bc_theta, bc_gt = [], []
-        bc_y_pred_all, bc_y_true_all = [], []
+        bc_y_pred_all, bc_y_var_all, bc_y_true_all = [], [], []
         for Xb, yb, thb in tqdm(
             _iter_batches(stream_bc, batch_size), desc="  BC  "
         ):
@@ -422,7 +438,9 @@ def main():
 
             mu_s = koh._nn_predict(Xb_s, koh.mean_theta_s())  # [B]
             mu_raw = gt_tf.y_s_to_raw(mu_s)
+            var_raw = np.full_like(np.asarray(mu_raw, dtype=float).reshape(-1), 1e-12)
             bc_y_pred_all.append(np.asarray(mu_raw, dtype=float).reshape(-1))
+            bc_y_var_all.append(var_raw)
             bc_y_true_all.append(np.asarray(yb, dtype=float).reshape(-1))
         print(f"  BC   done in {timer() - t0:.1f}s  ({len(bc_theta)} batches)")
 
@@ -444,7 +462,7 @@ def main():
 
         stream_ours = _make_stream(mode, args.data_dir, args.csv)
         ours_theta, ours_gt = [], []
-        ours_y_pred_all, ours_y_true_all = [], []
+        ours_y_pred_all, ours_y_var_all, ours_y_true_all = [], [], []
         for Xb, yb, thb in tqdm(
             _iter_batches(stream_ours, batch_size), desc="  Ours"
         ):
@@ -460,9 +478,13 @@ def main():
             ours_gt.append(float(np.mean(thb)))
 
             mu_s = pred.get("mu_sim", pred.get("mu"))
+            var_s = pred.get("var_sim", pred.get("var"))
             mu_s = mu_s.detach().cpu().numpy().reshape(-1)
+            var_s = var_s.detach().cpu().numpy().reshape(-1)
             mu_raw = gt_tf.y_s_to_raw(mu_s)
+            var_raw = np.clip(var_s, 1e-12, None) * (float(gt_tf.y_scaler.scale_[0]) ** 2)
             ours_y_pred_all.append(np.asarray(mu_raw, dtype=float).reshape(-1))
+            ours_y_var_all.append(np.asarray(var_raw, dtype=float).reshape(-1))
             ours_y_true_all.append(np.asarray(yb, dtype=float).reshape(-1))
         print(f"  Ours done in {timer() - t0:.1f}s  ({len(ours_theta)} batches)")
 
@@ -484,9 +506,9 @@ def main():
 
         # ---- per-mode metrics (theta rmse/crps, y rmse/crps) ----
         method_y_data = {
-            "DA": (da_y_pred_all, da_y_true_all),
-            "BC": (bc_y_pred_all, bc_y_true_all),
-            "Ours": (ours_y_pred_all, ours_y_true_all),
+            "DA": (da_y_pred_all, da_y_var_all, da_y_true_all),
+            "BC": (bc_y_pred_all, bc_y_var_all, bc_y_true_all),
+            "Ours": (ours_y_pred_all, ours_y_var_all, ours_y_true_all),
         }
         for lbl in ["DA", "BC", "Ours"]:
             theta_hat = np.asarray(all_results[mode][lbl], dtype=float)
@@ -495,13 +517,14 @@ def main():
             theta_rmse = _rmse(theta_err)
             theta_crps = _crps_simple(theta_hat, theta_true)
 
-            y_pred_batches, y_true_batches = method_y_data[lbl]
+            y_pred_batches, y_var_batches, y_true_batches = method_y_data[lbl]
             if len(y_pred_batches) > 0:
                 y_pred = np.concatenate(y_pred_batches, axis=0)
+                y_var = np.concatenate(y_var_batches, axis=0)
                 y_true = np.concatenate(y_true_batches, axis=0)
                 y_err = y_pred - y_true
                 y_rmse = _rmse(y_err)
-                y_crps = _crps_simple(y_pred, y_true)
+                y_crps = _gaussian_crps_mean(y_pred, y_var, y_true)
             else:
                 y_rmse, y_crps = float("nan"), float("nan")
 

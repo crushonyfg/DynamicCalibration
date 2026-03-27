@@ -32,6 +32,151 @@ from .configs import BOCPDConfig, ModelConfig
 from scipy.special import logsumexp
 from scipy.spatial.distance import cdist
 
+def _finite_mean(values) -> float:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    return float(arr.mean()) if arr.size > 0 else float("nan")
+
+
+def _theta_var_from_others(others_hist, n: int) -> np.ndarray:
+    vals = []
+    for item in others_hist[:n]:
+        if isinstance(item, dict):
+            vals.append(float(item.get("var", float("nan"))))
+        else:
+            vals.append(float("nan"))
+    return np.asarray(vals, dtype=float)
+
+
+def _summarize_slope_result(data: dict) -> dict:
+    theta = np.asarray(data.get("theta", []), dtype=float)
+    theta_oracle = np.asarray(data.get("theta_oracle", []), dtype=float)
+    theta_var = np.asarray(data.get("theta_var", []), dtype=float)
+    rmse = np.asarray(data.get("rmse", []), dtype=float)
+    crps_hist = np.asarray(data.get("crps_hist", []), dtype=float)
+
+    n = min(len(theta), len(theta_oracle), len(theta_var))
+    if n == 0:
+        theta_rmse = float("nan")
+        theta_crps = float("nan")
+    else:
+        theta_rmse = float(np.sqrt(np.mean((theta[:n] - theta_oracle[:n]) ** 2)))
+        theta_crps = float(
+            crps_gaussian(
+                torch.tensor(theta[:n], dtype=torch.float64),
+                torch.tensor(np.clip(theta_var[:n], 1e-12, None), dtype=torch.float64),
+                torch.tensor(theta_oracle[:n], dtype=torch.float64),
+            ).mean().item()
+        )
+
+    return dict(
+        theta_rmse=theta_rmse,
+        theta_crps=theta_crps,
+        y_rmse=_finite_mean(rmse),
+        y_crps=_finite_mean(crps_hist),
+    )
+
+
+def _save_gradual_ablation_tables(df_metrics, store_dir: str) -> None:
+    import pandas as pd
+
+    table_methods = [
+        "R-BOCPD-PF-nodiscrepancy",
+        "R-BOCPD-PF-halfdiscrepancy",
+        "R-BOCPD-PF-halfdiscrepancy-hybrid",
+        "RBOCPD_half_STDGate_dual",
+        "R-BOCPD-PF-OGP",
+    ]
+    labels = {
+        "R-BOCPD-PF-nodiscrepancy": ("yes", "no", "no", "no"),
+        "R-BOCPD-PF-halfdiscrepancy": ("yes", "yes", "no", "no"),
+        "R-BOCPD-PF-halfdiscrepancy-hybrid": ("yes", "yes", "yes", "no"),
+        "RBOCPD_half_STDGate_dual": ("yes", "yes", "yes", "yes"),
+        "R-BOCPD-PF-OGP": ("reference", "reference", "reference", "reference"),
+    }
+
+    sub = df_metrics[df_metrics["method"].isin(table_methods)].copy()
+    if len(sub) == 0:
+        return
+
+    grouped = sub.groupby("method").agg({
+        "theta_rmse": ["mean", "std"],
+        "theta_crps": ["mean", "std"],
+        "y_rmse": ["mean", "std"],
+        "y_crps": ["mean", "std"],
+    })
+
+    rows = []
+    for method in table_methods:
+        if method not in grouped.index:
+            continue
+        stats = grouped.loc[method]
+        disc_free_pf, half_disc, dual_restart, single_gate = labels[method]
+        rows.append({
+            "Method": method,
+            "Discrepancy-free PF": disc_free_pf,
+            "Half-discrepancy": half_disc,
+            "Dual Restart": dual_restart,
+            "Single-step Gate": single_gate,
+            "theta_rmse_mean": float(stats[("theta_rmse", "mean")]),
+            "theta_rmse_std": float(stats[("theta_rmse", "std")]),
+            "theta_crps_mean": float(stats[("theta_crps", "mean")]),
+            "theta_crps_std": float(stats[("theta_crps", "std")]),
+            "y_rmse_mean": float(stats[("y_rmse", "mean")]),
+            "y_rmse_std": float(stats[("y_rmse", "std")]),
+            "y_crps_mean": float(stats[("y_crps", "mean")]),
+            "y_crps_std": float(stats[("y_crps", "std")]),
+        })
+
+    if len(rows) == 0:
+        return
+    df = pd.DataFrame(rows)
+    df.to_csv(f"{store_dir}/ablation_gradual_metrics.csv", index=False)
+    df.to_excel(f"{store_dir}/ablation_gradual_metrics.xlsx", index=False)
+
+
+def _save_gradual_appendix_table(df_metrics, store_dir: str) -> None:
+    import pandas as pd
+
+    table_methods = [
+        "RBOCPD_half_STDGate",
+        "RBOCPD_half_STDGate_particleGP",
+        "RBOCPD_half_STDGate_particleBasis",
+    ]
+    sub = df_metrics[df_metrics["method"].isin(table_methods)].copy()
+    if len(sub) == 0:
+        return
+
+    grouped = sub.groupby("method").agg({
+        "theta_rmse": ["mean", "std"],
+        "theta_crps": ["mean", "std"],
+        "y_rmse": ["mean", "std"],
+        "y_crps": ["mean", "std"],
+    })
+
+    rows = []
+    for method in table_methods:
+        if method not in grouped.index:
+            continue
+        stats = grouped.loc[method]
+        rows.append({
+            "Method": method,
+            "theta_rmse_mean": float(stats[("theta_rmse", "mean")]),
+            "theta_rmse_std": float(stats[("theta_rmse", "std")]),
+            "theta_crps_mean": float(stats[("theta_crps", "mean")]),
+            "theta_crps_std": float(stats[("theta_crps", "std")]),
+            "y_rmse_mean": float(stats[("y_rmse", "mean")]),
+            "y_rmse_std": float(stats[("y_rmse", "std")]),
+            "y_crps_mean": float(stats[("y_crps", "mean")]),
+            "y_crps_std": float(stats[("y_crps", "std")]),
+        })
+
+    if len(rows) == 0:
+        return
+    df = pd.DataFrame(rows)
+    df.to_csv(f"{store_dir}/appendix_extension_gradual_metrics.csv", index=False)
+    df.to_excel(f"{store_dir}/appendix_extension_gradual_metrics.xlsx", index=False)
+
 # -------------------------------------------------------------
 # Simulator (Config2)
 # -------------------------------------------------------------
@@ -865,6 +1010,13 @@ def run_one_slope(
             cfg.bocpd.cusum_mode = str(meta.get("cusum_mode", "cumulative"))
             cfg.bocpd.standardized_gate_threshold = float(meta.get("standardized_gate_threshold", 3.0))
             cfg.bocpd.standardized_gate_consecutive = int(meta.get("standardized_gate_consecutive", 1))
+            cfg.bocpd.particle_delta_mode = str(meta.get("particle_delta_mode", "shared_gp"))
+            cfg.bocpd.particle_gp_hyper_candidates = meta.get("particle_gp_hyper_candidates", None)
+            cfg.bocpd.particle_basis_kind = str(meta.get("particle_basis_kind", "rbf"))
+            cfg.bocpd.particle_basis_num_features = int(meta.get("particle_basis_num_features", 8))
+            cfg.bocpd.particle_basis_lengthscale = float(meta.get("particle_basis_lengthscale", 0.25))
+            cfg.bocpd.particle_basis_ridge = float(meta.get("particle_basis_ridge", 1e-2))
+            cfg.bocpd.particle_basis_noise = float(meta.get("particle_basis_noise", cfg.model.delta_kernel.noise))
             roll = RollingStats(window=50)
 
             if meta["mode"] == "restart":
@@ -1189,6 +1341,7 @@ def run_one_slope(
             results[name] = dict(
                     theta=np.array(theta_hist),
                     theta_oracle=np.array(oracle_hist),
+                    theta_var=_theta_var_from_others(others_hist, len(theta_hist)),
                     others=others_hist,
                     rmse=np.array(rmse_hist),
                     top0_particles_hist=top0_particles_hist,
@@ -1212,6 +1365,7 @@ def run_one_slope(
             results[name] = dict(
                     theta=np.array(theta_hist),
                     theta_oracle=np.array(oracle_hist),
+                    theta_var=_theta_var_from_others(others_hist, len(theta_hist)),
                     others=others_hist,
                     rmse=np.array(rmse_hist),
                     top0_particles_hist=top0_particles_hist,
@@ -1245,9 +1399,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--out_dir", type=str, default="figs/slope_deltaCmp_v2")
+    parser.add_argument("--profile", type=str, default="main", choices=["main", "ablation", "appendix"])
     args = parser.parse_args()
 
-    if args.debug:
+    if args.profile in ("ablation", "appendix"):
+        # seeds = [101, 202, 303, 404, 505]
+        seeds = range(10)
+        batch_sizes = [20]
+        slopes = [0.0005, 0.001, 0.0015, 0.002, 0.0025]
+    elif args.debug:
         seeds = [456]
         batch_sizes = [10]
         slopes = [0.001]
@@ -1273,43 +1433,207 @@ def main():
     else:
         phi2_of_theta = None
 
-    methods = {
-        # "DA": dict(type="da"),
-        # "BC": dict(type="bc"),
-        # "BPC-80": dict(type="bpc"),
-        # "BOCPD-BPC": dict(type="bpc_bocpd"),
-        # "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
-        # "PF-OGP": dict(type="pf_ogp"),
-        # "BOCPD-PF": dict(type="bocpd", mode="standard"),
-        # "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True, bocpd_use_discrepancy=True),
-        # "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
-        # "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
-        # "R-BOCPD-PF-halfdiscrepancy-hybrid": dict(
-        #     type="bocpd",
-        #     mode="restart",
-        #     use_discrepancy=False,
-        #     bocpd_use_discrepancy=True,
-        #     restart_impl="hybrid_260319",
-        #     hybrid_partial_restart=True,
-        #     hybrid_tau_delta=0.05,
-        #     hybrid_tau_theta=0.05,
-        # ),
-        "RBOCPD_half_STDGate": dict(
-            type="bocpd",
-            mode="restart",
-            use_discrepancy=False,
-            bocpd_use_discrepancy=True,
-            restart_impl="rolled_cusum_260324",
-            use_dual_restart=False,
-            use_cusum=True,
-            cusum_mode="standardized_gate",
-            standardized_gate_threshold=3.0,
-            standardized_gate_consecutive=1,
-            cusum_recent_obs=20,
-            hybrid_tau_delta=0.05,
-            hybrid_tau_theta=0.05,
-        ),
-    }
+    if args.profile == "ablation":
+        methods = {
+            # "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
+            # "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
+            # "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
+            # "R-BOCPD-PF-halfdiscrepancy-hybrid": dict(
+            #     type="bocpd",
+            #     mode="restart",
+            #     use_discrepancy=False,
+            #     bocpd_use_discrepancy=True,
+            #     restart_impl="hybrid_260319",
+            #     hybrid_partial_restart=True,
+            #     hybrid_tau_delta=0.05,
+            #     hybrid_tau_theta=0.05,
+            # ),
+            # "RBOCPD_half_STDGate_dual": dict(
+            #     type="bocpd",
+            #     mode="restart",
+            #     use_discrepancy=False,
+            #     bocpd_use_discrepancy=True,
+            #     restart_impl="rolled_cusum_260324",
+            #     use_dual_restart=True,
+            #     use_cusum=True,
+            #     cusum_mode="standardized_gate",
+            #     standardized_gate_threshold=3.0,
+            #     standardized_gate_consecutive=1,
+            #     cusum_recent_obs=20,
+            #     hybrid_tau_delta=0.05,
+            #     hybrid_tau_theta=0.05,
+            #     hybrid_tau_full=0.05,
+            #     hybrid_delta_share_rho=0.75,
+            #     hybrid_pf_sigma_mode="fixed",
+            #     hybrid_sigma_delta_alpha=1.0,
+            #     hybrid_sigma_ema_beta=0.98,
+            #     hybrid_sigma_min=1e-4,
+            #     hybrid_sigma_max=10.0,
+            # ),
+            # "RBOCPD_half_STDGate_particleGP_dual": dict(
+            #     type="bocpd",
+            #     mode="restart",
+            #     use_discrepancy=False,
+            #     bocpd_use_discrepancy=True,
+            #     restart_impl="rolled_cusum_260324",
+            #     use_dual_restart=True,
+            #     use_cusum=True,
+            #     cusum_mode="standardized_gate",
+            #     standardized_gate_threshold=3.0,
+            #     standardized_gate_consecutive=1,
+            #     cusum_recent_obs=20,
+            #     hybrid_tau_delta=0.05,
+            #     hybrid_tau_theta=0.05,
+            #     particle_delta_mode="particle_gp_shared_hyper",
+            # ),
+            # "RBOCPD_half_STDGate_particleGP": dict(
+            #     type="bocpd",
+            #     mode="restart",
+            #     use_discrepancy=False,
+            #     bocpd_use_discrepancy=True,
+            #     restart_impl="rolled_cusum_260324",
+            #     use_dual_restart=False,
+            #     use_cusum=True,
+            #     cusum_mode="standardized_gate",
+            #     standardized_gate_threshold=3.0,
+            #     standardized_gate_consecutive=1,
+            #     cusum_recent_obs=20,
+            #     hybrid_tau_delta=0.05,
+            #     hybrid_tau_theta=0.05,
+            #     particle_delta_mode="particle_gp_shared_hyper",
+            # ),
+            # "RBOCPD_half_particleGP": dict(
+            #     type="bocpd",
+            #     mode="restart",
+            #     use_discrepancy=False,
+            #     bocpd_use_discrepancy=True,
+            #     restart_impl="rolled_cusum_260324",
+            #     use_dual_restart=False,
+            #     use_cusum=False,
+            #     cusum_mode="standardized_gate",
+            #     standardized_gate_threshold=3.0,
+            #     standardized_gate_consecutive=1,
+            #     cusum_recent_obs=20,
+            #     hybrid_tau_delta=0.05,
+            #     hybrid_tau_theta=0.05,
+            #     particle_delta_mode="particle_gp_shared_hyper",
+            # ),
+            "RBOCPD_half_STDGate": dict(
+                type="bocpd",
+                mode="restart",
+                use_discrepancy=False,
+                bocpd_use_discrepancy=True,
+                restart_impl="rolled_cusum_260324",
+                use_dual_restart=False,
+                use_cusum=True,
+                cusum_mode="standardized_gate",
+                standardized_gate_threshold=3.0,
+                standardized_gate_consecutive=1,
+                cusum_recent_obs=20,
+                hybrid_tau_delta=0.05,
+                hybrid_tau_theta=0.05,
+                hybrid_tau_full=0.05,
+                hybrid_delta_share_rho=0.75,
+                hybrid_pf_sigma_mode="fixed",
+                hybrid_sigma_delta_alpha=1.0,
+                hybrid_sigma_ema_beta=0.98,
+                hybrid_sigma_min=1e-4,
+                hybrid_sigma_max=10.0,
+            ),
+        }
+    elif args.profile == "appendix":
+        methods = {
+            "RBOCPD_half_STDGate": dict(
+                type="bocpd",
+                mode="restart",
+                use_discrepancy=False,
+                bocpd_use_discrepancy=True,
+                restart_impl="rolled_cusum_260324",
+                use_dual_restart=False,
+                use_cusum=True,
+                cusum_mode="standardized_gate",
+                standardized_gate_threshold=3.0,
+                standardized_gate_consecutive=1,
+                cusum_recent_obs=20,
+                hybrid_tau_delta=0.05,
+                hybrid_tau_theta=0.05,
+            ),
+            "RBOCPD_half_STDGate_particleGP": dict(
+                type="bocpd",
+                mode="restart",
+                use_discrepancy=False,
+                bocpd_use_discrepancy=True,
+                restart_impl="rolled_cusum_260324",
+                use_dual_restart=False,
+                use_cusum=True,
+                cusum_mode="standardized_gate",
+                standardized_gate_threshold=3.0,
+                standardized_gate_consecutive=1,
+                cusum_recent_obs=20,
+                hybrid_tau_delta=0.05,
+                hybrid_tau_theta=0.05,
+                particle_delta_mode="particle_gp_shared_hyper",
+            ),
+            "RBOCPD_half_STDGate_particleBasis": dict(
+                type="bocpd",
+                mode="restart",
+                use_discrepancy=False,
+                bocpd_use_discrepancy=True,
+                restart_impl="rolled_cusum_260324",
+                use_dual_restart=False,
+                use_cusum=True,
+                cusum_mode="standardized_gate",
+                standardized_gate_threshold=3.0,
+                standardized_gate_consecutive=1,
+                cusum_recent_obs=20,
+                hybrid_tau_delta=0.05,
+                hybrid_tau_theta=0.05,
+                particle_delta_mode="particle_basis",
+                particle_basis_kind="rbf",
+                particle_basis_num_features=8,
+                particle_basis_lengthscale=0.25,
+                particle_basis_ridge=1e-2,
+            ),
+        }
+    else:
+        methods = {
+            "RBOCPD_half_STDGate_particleGP": dict(
+                type="bocpd",
+                mode="restart",
+                use_discrepancy=False,
+                bocpd_use_discrepancy=True,
+                restart_impl="rolled_cusum_260324",
+                use_dual_restart=False,
+                use_cusum=True,
+                cusum_mode="standardized_gate",
+                standardized_gate_threshold=3.0,
+                standardized_gate_consecutive=1,
+                cusum_recent_obs=20,
+                hybrid_tau_delta=0.05,
+                hybrid_tau_theta=0.05,
+                particle_delta_mode="particle_gp_shared_hyper",
+            ),
+            "RBOCPD_half_STDGate_particleBasis": dict(
+                type="bocpd",
+                mode="restart",
+                use_discrepancy=False,
+                bocpd_use_discrepancy=True,
+                restart_impl="rolled_cusum_260324",
+                use_dual_restart=False,
+                use_cusum=True,
+                cusum_mode="standardized_gate",
+                standardized_gate_threshold=3.0,
+                standardized_gate_consecutive=1,
+                cusum_recent_obs=20,
+                hybrid_tau_delta=0.05,
+                hybrid_tau_theta=0.05,
+                particle_delta_mode="particle_basis",
+                particle_basis_kind="rbf",
+                particle_basis_num_features=8,
+                particle_basis_lengthscale=0.25,
+                particle_basis_ridge=1e-2,
+            ),
+        }
 
     all_results = {}
     import itertools
@@ -1348,23 +1672,17 @@ def main():
         res = all_results[(s, batch_size, seed)]  # 注意：当前代码中 all_results[s] 会被覆盖，需要改为 all_results[(s, batch_size, seed)]
         
         for method_name, data in res.items():
-            # 计算 theta_rmse: sqrt(mean((theta_pred - theta_oracle)^2))
-            theta_rmse = np.sqrt(np.mean((data["theta"] - data["theta_oracle"]) ** 2))
-            
-            # y_rmse 已经存在于 data["rmse"] 中
-            y_rmse_mean = np.mean(data["rmse"])
-            
-            # y_crps 已经存在于 data["crps_hist"] 中
-            y_crps_mean = np.mean(data["crps_hist"])
-            
+            metrics = _summarize_slope_result(data)
+
             all_metrics.append({
                 "method": method_name,
                 "slope": s,
                 "batch_size": batch_size,
                 "seed": seed,
-                "theta_rmse": theta_rmse,
-                "y_rmse": y_rmse_mean,
-                "y_crps": y_crps_mean,
+                "theta_rmse": metrics["theta_rmse"],
+                "theta_crps": metrics["theta_crps"],
+                "y_rmse": metrics["y_rmse"],
+                "y_crps": metrics["y_crps"],
             })
 
             if "restart_mode_hist" in data:
@@ -1372,7 +1690,8 @@ def main():
                 n = max(len(rm), 1)
                 n_none = sum(1 for v in rm if v == "none")
                 n_delta = sum(1 for v in rm if v == "delta_only")
-                n_full = sum(1 for v in rm if v not in ("none", "delta_only"))
+                n_gate = sum(1 for v in rm if v in ("standardized_gate_refresh", "cusum_refresh"))
+                n_full = sum(1 for v in rm if v == "full")
                 restart_mode_rows.append({
                     "method": method_name,
                     "slope": s,
@@ -1381,9 +1700,11 @@ def main():
                     "n_steps": len(rm),
                     "none_ratio": n_none / n,
                     "delta_only_ratio": n_delta / n,
+                    "gate_refresh_ratio": n_gate / n,
                     "full_ratio": n_full / n,
                     "n_none": n_none,
                     "n_delta_only": n_delta,
+                    "n_gate_refresh": n_gate,
                     "n_full": n_full,
                 })
 
@@ -1401,7 +1722,7 @@ def main():
         # aggregated plot: by method and slope, averaged across seeds/batch sizes
         df_plot = (
             df_restart.groupby(["method", "slope"], as_index=False)[
-                ["none_ratio", "delta_only_ratio", "full_ratio"]
+                ["none_ratio", "delta_only_ratio", "gate_refresh_ratio", "full_ratio"]
             ]
             .mean()
             .sort_values(["method", "slope"])
@@ -1414,8 +1735,9 @@ def main():
                 x,
                 sub["none_ratio"].values,
                 sub["delta_only_ratio"].values,
+                sub["gate_refresh_ratio"].values,
                 sub["full_ratio"].values,
-                labels=["none", "delta_only", "full"],
+                labels=["none", "delta_only", "gate_refresh", "full"],
                 alpha=0.9,
             )
             plt.xticks(x, [f"{v:.4g}" for v in sub["slope"].values], rotation=0)
@@ -1435,6 +1757,7 @@ def main():
 
     grouped = df_metrics.groupby("method").agg({
         "theta_rmse": ["mean", "std"],
+        "theta_crps": ["mean", "std"],
         "y_rmse": ["mean", "std"],
         "y_crps": ["mean", "std"],
     })
@@ -1442,9 +1765,15 @@ def main():
     for method in df_metrics["method"].unique():
         print(f"\n{method}:")
         stats = grouped.loc[method]
-        print(f"  theta_rmse: {stats[('theta_rmse', 'mean')]:.6f} ± {stats[('theta_rmse', 'std')]:.6f}")
-        print(f"  y_rmse:     {stats[('y_rmse', 'mean')]:.6f} ± {stats[('y_rmse', 'std')]:.6f}")
-        print(f"  y_crps:     {stats[('y_crps', 'mean')]:.6f} ± {stats[('y_crps', 'std')]:.6f}")
+        print(f"  theta_rmse: {stats[('theta_rmse', 'mean')]:.6f} ? {stats[('theta_rmse', 'std')]:.6f}")
+        print(f"  theta_crps: {stats[('theta_crps', 'mean')]:.6f} ? {stats[('theta_crps', 'std')]:.6f}")
+        print(f"  y_rmse:     {stats[('y_rmse', 'mean')]:.6f} ? {stats[('y_rmse', 'std')]:.6f}")
+        print(f"  y_crps:     {stats[('y_crps', 'mean')]:.6f} ? {stats[('y_crps', 'std')]:.6f}")
+
+    if args.profile == "ablation":
+        _save_gradual_ablation_tables(df_metrics, store_dir)
+    if args.profile == "appendix":
+        _save_gradual_appendix_table(df_metrics, store_dir)
 
     print("\n" + "="*70)
 

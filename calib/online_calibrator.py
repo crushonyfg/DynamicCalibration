@@ -158,6 +158,30 @@ class OnlineBayesCalibrator:
             out["p_cp"] = out.get("p_cp", 0.0)
         return out
 
+    def _predict_expert_delta(self, e, X_batch: torch.Tensor):
+        if getattr(e, "delta_state", None) is not None:
+            ds = e.delta_state
+            if hasattr(ds, "predict_for_particles"):
+                return ds.predict_for_particles(
+                    X_batch,
+                    e.pf.particles.theta,
+                    emulator=self.emulator,
+                    rho=self.cfg.model.rho,
+                )
+            return ds.predict(X_batch)
+
+        mu_deltas, var_deltas = [], []
+        for ds in getattr(e, "delta_states", []):
+            md, vd = ds.predict(X_batch)
+            mu_deltas.append(md)
+            var_deltas.append(vd)
+        if len(mu_deltas) == 0:
+            zeros = torch.zeros(X_batch.shape[0], dtype=X_batch.dtype, device=X_batch.device)
+            return zeros, zeros
+        mu_delta = torch.stack(mu_deltas, dim=1).mean(dim=1)
+        var_delta = torch.stack(var_deltas, dim=1).mean(dim=1)
+        return mu_delta, var_delta
+
     def predict_batch(self, X_batch: torch.Tensor) -> Dict[str, torch.Tensor]:
         """批量预测。支持标量 y（mu/var [batch]）与多维 y（mu/var [batch, dy]）。"""
         X_batch = X_batch.to(self.cfg.model.device, self.cfg.model.dtype)
@@ -183,16 +207,7 @@ class OnlineBayesCalibrator:
         for e in self.bocpd.experts:
             w_e = math.exp(e.log_mass)
             mu_eta, var_eta = self.emulator.predict(X_batch, e.pf.particles.theta)  # [B, N] or [B, N, dy]
-            try:
-                mu_delta, var_delta = e.delta_state.predict(X_batch)  # [B]
-            except Exception:
-                mu_deltas, var_deltas = [], []
-                for delta_state in e.delta_states:
-                    md, vd = delta_state.predict(X_batch)
-                    mu_deltas.append(md)
-                    var_deltas.append(vd)
-                mu_delta = torch.stack(mu_deltas, dim=1).mean(dim=1)
-                var_delta = torch.stack(var_deltas, dim=1).mean(dim=1)
+            mu_delta, var_delta = self._predict_expert_delta(e, X_batch)
             if mu_eta.dim() == 3 and mu_delta.dim() == 1:
                 mu_delta = mu_delta[:, None].expand(-1, mu_eta.shape[-1])
                 var_delta = var_delta[:, None].expand(-1, mu_eta.shape[-1])
@@ -251,16 +266,7 @@ class OnlineBayesCalibrator:
         for e in self.bocpd.experts:
             w_e = math.exp(e.log_mass)
             mu_eta, var_eta = self.emulator.predict(X_batch, e.pf.particles.theta)
-            try:
-                mu_delta, var_delta = e.delta_state.predict(X_batch)
-            except Exception:
-                mu_deltas, var_deltas = [], []
-                for ds in e.delta_states:
-                    md, vd = ds.predict(X_batch)
-                    mu_deltas.append(md)
-                    var_deltas.append(vd)
-                mu_delta = torch.stack(mu_deltas, dim=1).mean(dim=1)
-                var_delta = torch.stack(var_deltas, dim=1).mean(dim=1)
+            mu_delta, var_delta = self._predict_expert_delta(e, X_batch)
             if mu_eta.dim() == 3 and mu_delta.dim() == 1:
                 mu_delta = mu_delta[:, None].expand(-1, mu_eta.shape[-1])
                 var_delta = var_delta[:, None].expand(-1, mu_eta.shape[-1])

@@ -26,12 +26,12 @@ def predictive_stats(
     """
     if mu_eta.dim() == 2:
         # scalar output: [b, N]
-        try:
-            mu = rho * mu_eta + mu_delta[:, None]
-            var = (rho**2) * var_eta + var_delta[:, None] + (sigma_eps**2)
-        except Exception:
+        if mu_delta.dim() == 2:
             mu = rho * mu_eta + mu_delta
             var = (rho**2) * var_eta + var_delta + (sigma_eps**2)
+        else:
+            mu = rho * mu_eta + mu_delta[:, None]
+            var = (rho**2) * var_eta + var_delta[:, None] + (sigma_eps**2)
     else:
         # multi-dim output: mu_eta/var_eta [b, N, dy]; delta [b] or [b, dy]
         b, N, dy = mu_eta.shape
@@ -155,8 +155,16 @@ def loglik_and_grads(
     mu_eta, var_eta = emulator.predict(x, particles.theta)  # [b,N] or [b,N,dy]
     if use_discrepancy:
         if delta_state is not None:
-            mu_delta, var_delta = delta_state.predict(x)  # [b], [b]
-            if mu_eta.dim() == 3:
+            if hasattr(delta_state, "predict_for_particles"):
+                mu_delta, var_delta = delta_state.predict_for_particles(
+                    x,
+                    particles.theta,
+                    emulator=emulator,
+                    rho=rho,
+                )
+            else:
+                mu_delta, var_delta = delta_state.predict(x)  # [b], [b]
+            if mu_eta.dim() == 3 and mu_delta.dim() == 1:
                 dy = mu_eta.shape[-1]
                 mu_delta = mu_delta[:, None].expand(-1, dy)
                 var_delta = var_delta[:, None].expand(-1, dy)

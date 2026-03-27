@@ -30,6 +30,167 @@ from scipy.special import logsumexp
 from scipy.spatial.distance import cdist
 
 
+def _finite_mean(values) -> float:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    return float(arr.mean()) if arr.size > 0 else float("nan")
+
+
+def _gaussian_crps_mean(mu, var, y) -> float:
+    mu_t = torch.as_tensor(mu, dtype=torch.float64).detach().cpu()
+    var_t = torch.clamp(torch.as_tensor(var, dtype=torch.float64).detach().cpu(), min=1e-12)
+    y_t = torch.as_tensor(y, dtype=torch.float64).detach().cpu()
+    return float(crps_gaussian(mu_t, var_t, y_t).mean().item())
+
+
+def _theta_var_from_others(others_hist, n: int) -> np.ndarray:
+    vals = []
+    for item in others_hist[:n]:
+        if isinstance(item, dict):
+            vals.append(float(item.get("var", float("nan"))))
+        else:
+            vals.append(float("nan"))
+    return np.asarray(vals, dtype=float)
+
+
+def _summarize_sudden_result(data: dict) -> dict:
+    theta = np.asarray(data.get("theta", []), dtype=float)
+    theta_oracle = np.asarray(data.get("theta_oracle", []), dtype=float)
+    theta_var = np.asarray(data.get("theta_var", []), dtype=float)
+    rmse = np.asarray(data.get("rmse", []), dtype=float)
+    crps_hist = np.asarray(data.get("crps_hist", []), dtype=float)
+
+    n = min(len(theta), len(theta_oracle), len(theta_var))
+    if n == 0:
+        theta_rmse = float("nan")
+        theta_crps = float("nan")
+    else:
+        theta_rmse = float(np.sqrt(np.mean((theta[:n] - theta_oracle[:n]) ** 2)))
+        theta_crps = float(
+            crps_gaussian(
+                torch.tensor(theta[:n], dtype=torch.float64),
+                torch.tensor(np.clip(theta_var[:n], 1e-12, None), dtype=torch.float64),
+                torch.tensor(theta_oracle[:n], dtype=torch.float64),
+            ).mean().item()
+        )
+
+    return dict(
+        theta_rmse=theta_rmse,
+        theta_crps=theta_crps,
+        y_rmse=_finite_mean(rmse),
+        y_crps=_finite_mean(crps_hist),
+    )
+
+
+def _summarize_restart_events(data: dict) -> dict:
+    rm = list(data.get("restart_mode_hist", []))
+    cp_times = list(data.get("cp_times", []))
+    batch_size = int(data.get("batch_size", 1))
+    cp_batches = [int(cp // batch_size) for cp in cp_times]
+
+    corrective_modes = {"full", "delta_only", "standardized_gate_refresh", "cusum_refresh"}
+    full_count = sum(1 for v in rm if v == "full")
+    delta_count = sum(1 for v in rm if v == "delta_only")
+    gate_count = sum(1 for v in rm if v in ("standardized_gate_refresh", "cusum_refresh"))
+
+    tolerated_batches = set()
+    for cpb in cp_batches:
+        tolerated_batches.update({cpb, cpb + 1})
+    false_full = sum(1 for idx, v in enumerate(rm) if v == "full" and idx not in tolerated_batches)
+
+    delays = []
+    for cpb in cp_batches:
+        found = None
+        for idx, mode in enumerate(rm):
+            if idx >= cpb and mode in corrective_modes:
+                found = idx
+                break
+        delays.append(float(found - cpb) if found is not None else float("nan"))
+
+    return dict(
+        full_restart_count=float(full_count),
+        delta_only_count=float(delta_count),
+        gate_refresh_count=float(gate_count),
+        false_full_restart_count=float(false_full),
+        post_change_correction_delay=_finite_mean(delays),
+    )
+
+
+def _save_sudden_ablation_tables(df_metrics, df_restart_events, store_dir: str) -> None:
+    import pandas as pd
+
+    table_methods = [
+        "R-BOCPD-PF-halfdiscrepancy",
+        "R-BOCPD-PF-halfdiscrepancy-hybrid-rolled",
+        "RBOCPD_half_STDGate",
+        "RBOCPD_half_STDGate_dual",
+    ]
+    labels = {
+        "R-BOCPD-PF-halfdiscrepancy": ("Full", "No"),
+        "R-BOCPD-PF-halfdiscrepancy-hybrid-rolled": ("Dual", "No"),
+        "RBOCPD_half_STDGate": ("Full", "Yes"),
+        "RBOCPD_half_STDGate_dual": ("Dual", "Yes"),
+    }
+
+    sub_metrics = df_metrics[df_metrics["method"].isin(table_methods)].copy()
+    sub_events = df_restart_events[df_restart_events["method"].isin(table_methods)].copy()
+    if len(sub_metrics) == 0 or len(sub_events) == 0:
+        return
+
+    grouped_metrics = sub_metrics.groupby("method").agg({
+        "theta_rmse": ["mean", "std"],
+        "theta_crps": ["mean", "std"],
+        "y_rmse": ["mean", "std"],
+        "y_crps": ["mean", "std"],
+    })
+    grouped_events = sub_events.groupby("method").agg({
+        "full_restart_count": ["mean", "std"],
+        "delta_only_count": ["mean", "std"],
+        "gate_refresh_count": ["mean", "std"],
+        "false_full_restart_count": ["mean", "std"],
+        "post_change_correction_delay": ["mean", "std"],
+    })
+
+    rows = []
+    for method in table_methods:
+        if method not in grouped_metrics.index or method not in grouped_events.index:
+            continue
+        mstats = grouped_metrics.loc[method]
+        estats = grouped_events.loc[method]
+        restart_strategy, gate = labels[method]
+        rows.append({
+            "Method": method,
+            "Restart Strategy": restart_strategy,
+            "Gate": gate,
+            "theta_rmse_mean": float(mstats[("theta_rmse", "mean")]),
+            "theta_rmse_std": float(mstats[("theta_rmse", "std")]),
+            "theta_crps_mean": float(mstats[("theta_crps", "mean")]),
+            "theta_crps_std": float(mstats[("theta_crps", "std")]),
+            "y_rmse_mean": float(mstats[("y_rmse", "mean")]),
+            "y_rmse_std": float(mstats[("y_rmse", "std")]),
+            "y_crps_mean": float(mstats[("y_crps", "mean")]),
+            "y_crps_std": float(mstats[("y_crps", "std")]),
+            "full_restart_count_mean": float(estats[("full_restart_count", "mean")]),
+            "full_restart_count_std": float(estats[("full_restart_count", "std")]),
+            "delta_only_count_mean": float(estats[("delta_only_count", "mean")]),
+            "delta_only_count_std": float(estats[("delta_only_count", "std")]),
+            "gate_refresh_count_mean": float(estats[("gate_refresh_count", "mean")]),
+            "gate_refresh_count_std": float(estats[("gate_refresh_count", "std")]),
+            "false_full_restart_count_mean": float(estats[("false_full_restart_count", "mean")]),
+            "false_full_restart_count_std": float(estats[("false_full_restart_count", "std")]),
+            "post_change_correction_delay_mean": float(estats[("post_change_correction_delay", "mean")]),
+            "post_change_correction_delay_std": float(estats[("post_change_correction_delay", "std")]),
+        })
+
+    if len(rows) == 0:
+        return
+    df = pd.DataFrame(rows)
+    df.to_csv(f"{store_dir}/ablation_sudden_metrics.csv", index=False)
+    df.to_excel(f"{store_dir}/ablation_sudden_metrics.xlsx", index=False)
+    sub_events.to_csv(f"{store_dir}/ablation_sudden_restart_stats.csv", index=False)
+    sub_events.to_excel(f"{store_dir}/ablation_sudden_restart_stats.xlsx", index=False)
+
+
 # -------------------------------------------------------------
 # Simulator (Config2)
 # -------------------------------------------------------------
@@ -564,6 +725,7 @@ def run_one_sudden(
                     rmse_hist.append(
                         float(torch.sqrt(((mix_mu.cpu() - Yb64.cpu()) ** 2).mean()))
                     )
+                    crps_hist.append(_gaussian_crps_mean(mix_mu, mix_var, Yb64))
 
                 rec = bocpd.update_batch(
                     Xb64, Yb64, emulator, model_cfg, None, prior_sampler,
@@ -654,6 +816,7 @@ def run_one_sudden(
                     rmse_hist.append(
                         float(torch.sqrt(((mu_mix.cpu() - Yb64.cpu()) ** 2).mean()))
                     )
+                    crps_hist.append(_gaussian_crps_mean(mu_mix, var_mix, Yb64))
 
                 pf.step_batch(
                     Xb64, Yb64,
@@ -721,6 +884,13 @@ def run_one_sudden(
             cfg.bocpd.cusum_mode = str(meta.get("cusum_mode", "cumulative"))
             cfg.bocpd.standardized_gate_threshold = float(meta.get("standardized_gate_threshold", 3.0))
             cfg.bocpd.standardized_gate_consecutive = int(meta.get("standardized_gate_consecutive", 1))
+            cfg.bocpd.particle_delta_mode = str(meta.get("particle_delta_mode", "shared_gp"))
+            cfg.bocpd.particle_gp_hyper_candidates = meta.get("particle_gp_hyper_candidates", None)
+            cfg.bocpd.particle_basis_kind = str(meta.get("particle_basis_kind", "rbf"))
+            cfg.bocpd.particle_basis_num_features = int(meta.get("particle_basis_num_features", 8))
+            cfg.bocpd.particle_basis_lengthscale = float(meta.get("particle_basis_lengthscale", 0.25))
+            cfg.bocpd.particle_basis_ridge = float(meta.get("particle_basis_ridge", 1e-2))
+            cfg.bocpd.particle_basis_noise = float(meta.get("particle_basis_noise", cfg.model.delta_kernel.noise))
 
             if meta["mode"] == "restart":
                 cfg.model.use_discrepancy = meta["use_discrepancy"]
@@ -884,6 +1054,7 @@ def run_one_sudden(
                     mu_t, var_t = torch.tensor(mu_np, dtype=Yb.dtype, device=Yb.device), torch.tensor(var_np, dtype=Yb.dtype, device=Yb.device) 
                     rmse_hist.append(float(torch.sqrt(((mu_t - Yb) ** 2).mean())))
                     crps_sim = crps_gaussian(mu_t, var_t, Yb)
+                    crps_hist.append(float(crps_sim.mean().item()))
 
                 X_all, y_all = X_hist, y_hist
 
@@ -1084,6 +1255,7 @@ def run_one_sudden(
         results[name] = dict(
             theta=np.asarray(theta_hist, dtype=float),
             theta_oracle=np.asarray(oracle_hist, dtype=float),
+            theta_var=_theta_var_from_others(others_hist, len(theta_hist)),
             others=others_hist,
             rmse=np.asarray(rmse_hist, dtype=float),
             cp_times=cp_times,
@@ -1092,7 +1264,7 @@ def run_one_sudden(
             batch_size=bs,
             seed=int(seed),
             top0_particles_hist=top0_particles_hist,
-            crps_hist=np.array(crps_hist),
+            crps_hist=np.asarray(crps_hist, dtype=float),
             restart_mode_hist=restart_mode_hist,
         )
 
@@ -1144,6 +1316,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--out_dir", type=str, default="./figs/sudden_grid_outputs/v1")
+    parser.add_argument("--profile", type=str, default="main", choices=["main", "ablation"])
     args = parser.parse_args()
 
     out_dir = args.out_dir
@@ -1151,7 +1324,12 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     # --- experimental grid ---
-    if args.debug:
+    if args.profile == "ablation":
+        magnitudes = [0.5, 1.0, 2.0, 3.0]
+        seeds = list(range(10))
+        batch_sizes = [20]
+        seg_lens = [80, 120, 200]
+    elif args.debug:
         seeds = [456]               # you can add more
         batch_sizes = [20]      # you can add more
         seg_lens = [120]
@@ -1166,70 +1344,181 @@ def main():
         seg_lens = [80, 120, 200]  # frequency: smaller => more frequent CPs
 
     # methods
-    methods = {
-        # "DA": dict(type="da"),
-        # "BC": dict(type="bc"),
-        # "BOCPD-PF": dict(type="bocpd", mode="standard"),
-        # "BPC-80": dict(type="bpc"),
-        # "BOCPD-BPC": dict(type="bpc_bocpd"),
-        # "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
-        # "PF-OGP": dict(type="pf_ogp"),
-        # "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
-        # "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
-        # "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
-        # "R-BOCPD-PF-halfdiscrepancy-hybrid": dict(
-        #     type="bocpd",
-        #     mode="restart",
-        #     use_discrepancy=False,
-        #     bocpd_use_discrepancy=True,
-        #     restart_impl="hybrid_260319",
-        #     hybrid_partial_restart=True,
-        #     hybrid_tau_delta=0.05,
-        #     hybrid_tau_theta=0.05,
-        # ),
-        # "R-BOCPD-PF-halfdiscrepancy-hybrid-rolled": dict(
-        #     type="bocpd",
-        #     mode="restart",
-        #     use_discrepancy=False,
-        #     bocpd_use_discrepancy=True,
-        #     restart_impl="hybrid_260319",
-        #     hybrid_partial_restart=True,
-        #     hybrid_tau_delta=0.05,
-        #     hybrid_tau_theta=0.05,
-        #     hybrid_tau_full=0.05,
-        #     hybrid_delta_share_rho=0.75,
-        #     hybrid_pf_sigma_mode="rolled",
-        #     hybrid_sigma_delta_alpha=1.0,
-        #     hybrid_sigma_ema_beta=0.98,
-        #     hybrid_sigma_min=1e-4,
-        #     hybrid_sigma_max=10.0,
-        # ),
-        "RBOCPD_half_STDGate": dict(
-            type="bocpd",
-            mode="restart",
-            use_discrepancy=False,
-            bocpd_use_discrepancy=True,
-            restart_impl="rolled_cusum_260324",
-            use_dual_restart=False,
-            use_cusum=True,
-            cusum_mode="standardized_gate",
-            standardized_gate_threshold=3.0,
-            standardized_gate_consecutive=1,
-            cusum_recent_obs=20,
-            hybrid_tau_delta=0.05,
-            hybrid_tau_theta=0.05,
-            hybrid_tau_full=0.05,
-            hybrid_delta_share_rho=0.75,
-            hybrid_pf_sigma_mode="rolled",
-            hybrid_sigma_delta_alpha=1.0,
-            hybrid_sigma_ema_beta=0.98,
-            hybrid_sigma_min=1e-4,
-            hybrid_sigma_max=10.0,
-        ),
-        # "BPC-80": dict(type="bpc"),
-    }
+    if args.profile == "ablation":
+        methods = {
+            # "BOCPD-PF": dict(type="bocpd", mode="standard"),
+            # "BPC-80": dict(type="bpc"),
+            # "BOCPD-BPC": dict(type="bpc_bocpd"),
+            # "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
+            # "PF-OGP": dict(type="pf_ogp"),
+            # "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
+            "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
+            "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
+            # "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
+            # "R-BOCPD-PF-halfdiscrepancy-hybrid-rolled": dict(
+            #     type="bocpd",
+            #     mode="restart",
+            #     use_discrepancy=False,
+            #     bocpd_use_discrepancy=True,
+            #     restart_impl="hybrid_260319",
+            #     hybrid_partial_restart=True,
+            #     hybrid_tau_delta=0.05,
+            #     hybrid_tau_theta=0.05,
+            #     hybrid_tau_full=0.05,
+            #     hybrid_delta_share_rho=0.75,
+            #     hybrid_pf_sigma_mode="fixed",
+            #     hybrid_sigma_delta_alpha=1.0,
+            #     hybrid_sigma_ema_beta=0.98,
+            #     hybrid_sigma_min=1e-4,
+            #     hybrid_sigma_max=10.0,
+            # ),
+            # "RBOCPD_half_STDGate": dict(
+            #     type="bocpd",
+            #     mode="restart",
+            #     use_discrepancy=False,
+            #     bocpd_use_discrepancy=True,
+            #     restart_impl="rolled_cusum_260324",
+            #     use_dual_restart=False,
+            #     use_cusum=True,
+            #     cusum_mode="standardized_gate",
+            #     standardized_gate_threshold=3.0,
+            #     standardized_gate_consecutive=1,
+            #     cusum_recent_obs=20,
+            #     hybrid_tau_delta=0.05,
+            #     hybrid_tau_theta=0.05,
+            #     hybrid_tau_full=0.05,
+            #     hybrid_delta_share_rho=0.75,
+            #     hybrid_pf_sigma_mode="fixed",
+            #     hybrid_sigma_delta_alpha=1.0,
+            #     hybrid_sigma_ema_beta=0.98,
+            #     hybrid_sigma_min=1e-4,
+            #     hybrid_sigma_max=10.0,
+            # ),
+            # "RBOCPD_half_STDGate_dual": dict(
+            #     type="bocpd",
+            #     mode="restart",
+            #     use_discrepancy=False,
+            #     bocpd_use_discrepancy=True,
+            #     restart_impl="rolled_cusum_260324",
+            #     use_dual_restart=True,
+            #     use_cusum=True,
+            #     cusum_mode="standardized_gate",
+            #     standardized_gate_threshold=3.0,
+            #     standardized_gate_consecutive=1,
+            #     cusum_recent_obs=20,
+            #     hybrid_tau_delta=0.05,
+            #     hybrid_tau_theta=0.05,
+            #     hybrid_tau_full=0.05,
+            #     hybrid_delta_share_rho=0.75,
+            #     hybrid_pf_sigma_mode="fixed",
+            #     hybrid_sigma_delta_alpha=1.0,
+            #     hybrid_sigma_ema_beta=0.98,
+            #     hybrid_sigma_min=1e-4,
+            #     hybrid_sigma_max=10.0,
+            # ),
+            # "RBOCPD_half_STDGate_particleGP_dual": dict(
+            #     type="bocpd",
+            #     mode="restart",
+            #     use_discrepancy=False,
+            #     bocpd_use_discrepancy=True,
+            #     restart_impl="rolled_cusum_260324",
+            #     use_dual_restart=True,
+            #     use_cusum=True,
+            #     cusum_mode="standardized_gate",
+            #     standardized_gate_threshold=3.0,
+            #     standardized_gate_consecutive=1,
+            #     cusum_recent_obs=20,
+            #     hybrid_tau_delta=0.05,
+            #     hybrid_tau_theta=0.05,
+            #     particle_delta_mode="particle_gp_shared_hyper",
+            # ),
+            # "RBOCPD_half_STDGate_particleGP": dict(
+            #     type="bocpd",
+            #     mode="restart",
+            #     use_discrepancy=False,
+            #     bocpd_use_discrepancy=True,
+            #     restart_impl="rolled_cusum_260324",
+            #     use_dual_restart=False,
+            #     use_cusum=True,
+            #     cusum_mode="standardized_gate",
+            #     standardized_gate_threshold=3.0,
+            #     standardized_gate_consecutive=1,
+            #     cusum_recent_obs=20,
+            #     hybrid_tau_delta=0.05,
+            #     hybrid_tau_theta=0.05,
+            #     particle_delta_mode="particle_gp_shared_hyper",
+            # ),
+            # "RBOCPD_half_particleGP": dict(
+            #     type="bocpd",
+            #     mode="restart",
+            #     use_discrepancy=False,
+            #     bocpd_use_discrepancy=True,
+            #     restart_impl="rolled_cusum_260324",
+            #     use_dual_restart=False,
+            #     use_cusum=False,
+            #     cusum_mode="standardized_gate",
+            #     standardized_gate_threshold=3.0,
+            #     standardized_gate_consecutive=1,
+            #     cusum_recent_obs=20,
+            #     hybrid_tau_delta=0.05,
+            #     hybrid_tau_theta=0.05,
+            #     particle_delta_mode="particle_gp_shared_hyper",
+            # ),
+        }
+    else:
+        methods = {
+            "RBOCPD_half_STDGate_particleGP": dict(
+                type="bocpd",
+                mode="restart",
+                use_discrepancy=False,
+                bocpd_use_discrepancy=True,
+                restart_impl="rolled_cusum_260324",
+                use_dual_restart=False,
+                use_cusum=False,
+                cusum_mode="standardized_gate",
+                standardized_gate_threshold=3.0,
+                standardized_gate_consecutive=1,
+                cusum_recent_obs=20,
+                hybrid_tau_delta=0.05,
+                hybrid_tau_theta=0.05,
+                hybrid_tau_full=0.05,
+                hybrid_delta_share_rho=0.75,
+                hybrid_pf_sigma_mode="rolled",
+                hybrid_sigma_delta_alpha=1.0,
+                hybrid_sigma_ema_beta=0.98,
+                hybrid_sigma_min=1e-4,
+                hybrid_sigma_max=10.0,
+                particle_delta_mode="particle_gp_shared_hyper",
+            ),
+            "RBOCPD_half_STDGate_particleBasis": dict(
+                type="bocpd",
+                mode="restart",
+                use_discrepancy=False,
+                bocpd_use_discrepancy=True,
+                restart_impl="rolled_cusum_260324",
+                use_dual_restart=False,
+                use_cusum=False,
+                cusum_mode="standardized_gate",
+                standardized_gate_threshold=3.0,
+                standardized_gate_consecutive=1,
+                cusum_recent_obs=20,
+                hybrid_tau_delta=0.05,
+                hybrid_tau_theta=0.05,
+                hybrid_tau_full=0.05,
+                hybrid_delta_share_rho=0.75,
+                hybrid_pf_sigma_mode="rolled",
+                hybrid_sigma_delta_alpha=1.0,
+                hybrid_sigma_ema_beta=0.98,
+                hybrid_sigma_min=1e-4,
+                hybrid_sigma_max=10.0,
+                particle_delta_mode="particle_basis",
+                particle_basis_kind="rbf",
+                particle_basis_num_features=8,
+                particle_basis_lengthscale=0.25,
+                particle_basis_ridge=1e-2,
+            ),
+        }
 
-    # run grid
     all_results = {}
     for seg_len_L, delta_mag, batch_size, seed in itertools.product(seg_lens, magnitudes, batch_sizes, seeds):
         # skip invalid combos early (L must be divisible by batch_size)
@@ -1274,30 +1563,25 @@ def main():
 
     all_metrics = []
     restart_mode_rows = []
+    restart_event_rows = []
 
     for seg_len_L, delta_mag, batch_size, seed in itertools.product(seg_lens, magnitudes, batch_sizes, seeds):
         # 从 all_results 获取对应的 res
         res = all_results[(seg_len_L, delta_mag, batch_size, seed)]  # 注意：当前代码中 all_results[s] 会被覆盖，需要改为 all_results[(s, batch_size, seed)]
-        
+
         for method_name, data in res.items():
-            # 计算 theta_rmse: sqrt(mean((theta_pred - theta_oracle)^2))
-            theta_rmse = np.sqrt(np.mean((data["theta"] - data["theta_oracle"]) ** 2))
-            
-            # y_rmse 已经存在于 data["rmse"] 中
-            y_rmse_mean = np.mean(data["rmse"])
-            
-            # y_crps 已经存在于 data["crps_hist"] 中
-            y_crps_mean = np.mean(data["crps_hist"])
-            
+            metrics = _summarize_sudden_result(data)
+
             all_metrics.append({
                 "method": method_name,
                 "seg_len_L": seg_len_L,
                 "delta_mag": delta_mag,
                 "batch_size": batch_size,
                 "seed": seed,
-                "theta_rmse": theta_rmse,
-                "y_rmse": y_rmse_mean,
-                "y_crps": y_crps_mean,
+                "theta_rmse": metrics["theta_rmse"],
+                "theta_crps": metrics["theta_crps"],
+                "y_rmse": metrics["y_rmse"],
+                "y_crps": metrics["y_crps"],
             })
 
             if "restart_mode_hist" in data and len(data["restart_mode_hist"]) > 0:
@@ -1305,7 +1589,8 @@ def main():
                 n = len(rm)
                 n_none = sum(1 for v in rm if v == "none")
                 n_delta = sum(1 for v in rm if v == "delta_only")
-                n_full = sum(1 for v in rm if v not in ("none", "delta_only"))
+                n_gate = sum(1 for v in rm if v in ("standardized_gate_refresh", "cusum_refresh"))
+                n_full = sum(1 for v in rm if v == "full")
                 restart_mode_rows.append({
                     "method": method_name,
                     "seg_len_L": seg_len_L,
@@ -1315,10 +1600,21 @@ def main():
                     "n_steps": n,
                     "none_ratio": n_none / n,
                     "delta_only_ratio": n_delta / n,
+                    "gate_refresh_ratio": n_gate / n,
                     "full_ratio": n_full / n,
                     "n_none": n_none,
                     "n_delta_only": n_delta,
+                    "n_gate_refresh": n_gate,
                     "n_full": n_full,
+                })
+                event_metrics = _summarize_restart_events(data)
+                restart_event_rows.append({
+                    "method": method_name,
+                    "seg_len_L": seg_len_L,
+                    "delta_mag": delta_mag,
+                    "batch_size": batch_size,
+                    "seed": seed,
+                    **event_metrics,
                 })
 
     # 转换为 DataFrame 并保存
@@ -1326,6 +1622,8 @@ def main():
     df_metrics = pd.DataFrame(all_metrics)
     df_metrics.to_csv(f"{store_dir}/all_metrics.csv", index=False)
     df_metrics.to_excel(f"{store_dir}/all_metrics.xlsx", index=False)
+
+    df_restart_events = pd.DataFrame(restart_event_rows)
 
     if len(restart_mode_rows) > 0:
         df_restart = pd.DataFrame(restart_mode_rows)
@@ -1335,7 +1633,7 @@ def main():
         # Plot 1: ratio vs delta_mag (group by method, seg_len_L)
         df_plot_mag = (
             df_restart.groupby(["method", "seg_len_L", "delta_mag"], as_index=False)[
-                ["none_ratio", "delta_only_ratio", "full_ratio"]
+                ["none_ratio", "delta_only_ratio", "gate_refresh_ratio", "full_ratio"]
             ]
             .mean()
             .sort_values(["method", "seg_len_L", "delta_mag"])
@@ -1353,8 +1651,9 @@ def main():
                     x,
                     sub["none_ratio"].values,
                     sub["delta_only_ratio"].values,
+                    sub["gate_refresh_ratio"].values,
                     sub["full_ratio"].values,
-                    labels=["none", "delta_only", "full"],
+                    labels=["none", "delta_only", "gate_refresh", "full"],
                     alpha=0.9,
                 )
                 plt.xticks(x, [f"{v:.4g}" for v in sub["delta_mag"].values], rotation=0)
@@ -1374,6 +1673,7 @@ def main():
 
     grouped = df_metrics.groupby("method").agg({
         "theta_rmse": ["mean", "std"],
+        "theta_crps": ["mean", "std"],
         "y_rmse": ["mean", "std"],
         "y_crps": ["mean", "std"],
     })
@@ -1381,9 +1681,13 @@ def main():
     for method in df_metrics["method"].unique():
         print(f"\n{method}:")
         stats = grouped.loc[method]
-        print(f"  theta_rmse: {stats[('theta_rmse', 'mean')]:.6f} ± {stats[('theta_rmse', 'std')]:.6f}")
-        print(f"  y_rmse:     {stats[('y_rmse', 'mean')]:.6f} ± {stats[('y_rmse', 'std')]:.6f}")
-        print(f"  y_crps:     {stats[('y_crps', 'mean')]:.6f} ± {stats[('y_crps', 'std')]:.6f}")
+        print(f"  theta_rmse: {stats[('theta_rmse', 'mean')]:.6f} ? {stats[('theta_rmse', 'std')]:.6f}")
+        print(f"  theta_crps: {stats[('theta_crps', 'mean')]:.6f} ? {stats[('theta_crps', 'std')]:.6f}")
+        print(f"  y_rmse:     {stats[('y_rmse', 'mean')]:.6f} ? {stats[('y_rmse', 'std')]:.6f}")
+        print(f"  y_crps:     {stats[('y_crps', 'mean')]:.6f} ? {stats[('y_crps', 'std')]:.6f}")
+
+    if args.profile == "ablation":
+        _save_sudden_ablation_tables(df_metrics, df_restart_events, store_dir)
 
     print("\n" + "="*70)
 

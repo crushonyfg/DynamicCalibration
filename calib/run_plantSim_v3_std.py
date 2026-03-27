@@ -9,7 +9,7 @@ run_plantSim_v3_std.py - Plant Simulation 校准实验 (标准化版本)
     python -m calib.run_plantSim_v3_std --csv "C:/Users/yxu59/files/autumn2025/park/DynamicCalibration/physical_data.csv"
     
     # 其他参数
-    python -m calib.run_plantSim_v3_std --csv physical_data.csv --out_dir figs/plantSim/v3_std --modes 0 1 2
+    python -m calib.run_plantSim_v3_std --csv physical_data.csv --out_dir figs/plantSim/v3_stdSingle --modes 0 1 2
 """
 
 import math
@@ -53,6 +53,34 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import joblib
 from tqdm import tqdm
+
+
+def _finite_mean(values) -> float:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    return float(arr.mean()) if arr.size > 0 else float("nan")
+
+
+def _gaussian_crps_mean(mu, var, y) -> float:
+    mu_t = torch.as_tensor(mu, dtype=torch.float64).detach().cpu()
+    var_t = torch.clamp(torch.as_tensor(var, dtype=torch.float64).detach().cpu(), min=1e-12)
+    y_t = torch.as_tensor(y, dtype=torch.float64).detach().cpu()
+    return float(crps_gaussian(mu_t, var_t, y_t).mean().item())
+
+
+def _gaussian_crps_mean_raw(gt, mu_s, var_s, y_raw) -> float:
+    mu_np = torch.as_tensor(mu_s, dtype=torch.float64).detach().cpu().numpy().reshape(-1)
+    var_np = torch.as_tensor(var_s, dtype=torch.float64).detach().cpu().numpy().reshape(-1)
+    y_np = np.asarray(y_raw, dtype=float).reshape(-1)
+    y_scale = float(gt.y_scaler.scale_[0])
+    mu_raw = np.asarray(gt.y_s_to_raw(mu_np), dtype=float).reshape(-1)
+    var_raw = np.clip(var_np, 1e-12, None) * (y_scale ** 2)
+    return _gaussian_crps_mean(mu_raw, var_raw, y_np)
+
+
+def _default_sigma_eps_s() -> float:
+    return float(CalibrationConfig().model.sigma_eps)
+
 
 # =========================
 # 1) y transform: signed log1p
@@ -549,8 +577,8 @@ def summarize_metrics(result: dict):
         )
 
     # rmse_hist has an initial placeholder 0 in this script
-    y_rmse = float(np.mean(y_rmse_hist[1:])) if len(y_rmse_hist) > 1 else float("nan")
-    y_crps = float(np.mean(y_crps_hist)) if len(y_crps_hist) > 0 else float("nan")
+    y_rmse = _finite_mean(y_rmse_hist[1:]) if len(y_rmse_hist) > 1 else float("nan")
+    y_crps = _finite_mean(y_crps_hist) if len(y_crps_hist) > 0 else float("nan")
 
     return dict(
         theta_rmse=theta_rmse,
@@ -611,7 +639,7 @@ def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
             )
             bocpd_cfg = BOCPDConfig()
             bocpd_cfg.use_restart = True
-            model_cfg = ModelConfig(rho=1.0, sigma_eps=gt.y_scaler.scale_[0])
+            model_cfg = ModelConfig(rho=1.0, sigma_eps=float(meta.get("sigma_eps_s", _default_sigma_eps_s())))
             roll = OGPRollingStats(window=50)
 
             bocpd = BOCPD_OGP(
@@ -646,8 +674,7 @@ def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
                     mu_raw = gt.y_s_to_raw(mix_mu.cpu().numpy())
                     rmse = float(np.sqrt(np.mean((mu_raw - np.asarray(yb))**2)))
                     rmse_hist.append(rmse)
-                    y_crps = crps_gaussian(mix_mu.detach().cpu(), mix_var.detach().cpu(), newY.detach().cpu()).mean()
-                    y_crps_hist.append(float(y_crps.item()))
+                    y_crps_hist.append(_gaussian_crps_mean_raw(gt, mix_mu, mix_var, yb))
                 idx += 1
 
                 rec = bocpd.update_batch(
@@ -690,7 +717,7 @@ def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
                 particle_chunk_size=64,
                 max_hist=200,
             )
-            pf_model_cfg = ModelConfig(rho=1.0, sigma_eps=gt.y_scaler.scale_[0])
+            pf_model_cfg = ModelConfig(rho=1.0, sigma_eps=float(meta.get("sigma_eps_s", _default_sigma_eps_s())))
 
             pf = OGPParticleFilter(
                 ogp_cfg=pf_ogp_cfg,
@@ -719,8 +746,7 @@ def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
                     mu_raw = gt.y_s_to_raw(mu_mix.cpu().numpy())
                     rmse = float(np.sqrt(np.mean((mu_raw - np.asarray(yb))**2)))
                     rmse_hist.append(rmse)
-                    y_crps = crps_gaussian(mu_mix.detach().cpu(), var_mix.detach().cpu(), newY.detach().cpu()).mean()
-                    y_crps_hist.append(float(y_crps.item()))
+                    y_crps_hist.append(_gaussian_crps_mean_raw(gt, mu_mix, var_mix, yb))
                 idx += 1
 
                 pf.step_batch(
@@ -776,6 +802,14 @@ def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
             cfg.bocpd.cusum_mode = str(meta.get("cusum_mode", "cumulative"))
             cfg.bocpd.standardized_gate_threshold = float(meta.get("standardized_gate_threshold", 3.0))
             cfg.bocpd.standardized_gate_consecutive = int(meta.get("standardized_gate_consecutive", 1))
+            cfg.model.sigma_eps = float(meta.get("sigma_eps_s", cfg.model.sigma_eps))
+            cfg.bocpd.particle_delta_mode = str(meta.get("particle_delta_mode", "shared_gp"))
+            cfg.bocpd.particle_gp_hyper_candidates = meta.get("particle_gp_hyper_candidates", None)
+            cfg.bocpd.particle_basis_kind = str(meta.get("particle_basis_kind", "rbf"))
+            cfg.bocpd.particle_basis_num_features = int(meta.get("particle_basis_num_features", 8))
+            cfg.bocpd.particle_basis_lengthscale = float(meta.get("particle_basis_lengthscale", 0.25))
+            cfg.bocpd.particle_basis_ridge = float(meta.get("particle_basis_ridge", 1e-2))
+            cfg.bocpd.particle_basis_noise = float(meta.get("particle_basis_noise", cfg.model.delta_kernel.noise))
 
             if meta["mode"] == "restart":
                 cfg.model.use_discrepancy = meta["use_discrepancy"]
@@ -793,8 +827,7 @@ def run_plantSim(mode, methods, batch_size, data_dir=None, csv_path=None):
                     mu_raw = gt.y_s_to_raw(mu_s)
                     rmse = float(np.sqrt(np.mean((mu_raw - np.asarray(yb))**2)))
                     rmse_hist.append(rmse)
-                    y_crps = crps_gaussian(pred["mu"].detach().cpu(), pred["var"].detach().cpu(), newY.detach().cpu()).mean()
-                    y_crps_hist.append(float(y_crps.item()))
+                    y_crps_hist.append(_gaussian_crps_mean_raw(gt, pred["mu"], pred["var"], yb))
                     report_sub_hist = (pred_comp["crps_sim"].item(),pred_comp["experts_logpred"],pred_comp["var_sim"])
                     comp_rmse_hist.append(report_sub_hist)
 
@@ -863,25 +896,59 @@ if __name__ == "__main__":
     methods = {
         # "BPC-80": dict(type="bpc"),
         # "BOCPD-BPC": dict(type="bpc_bocpd"),
-        "R-BOCPD-PF-OGP": dict(type="ogp_bocpd"),
-        "RBOCPD_half_STDGate": dict(
-            type="bocpd",
-            mode="restart",
-            use_discrepancy=False,
-            bocpd_use_discrepancy=True,
-            restart_impl="rolled_cusum_260324",
-            use_dual_restart=True,
-            use_cusum=True,
-            cusum_mode="standardized_gate",
-            standardized_gate_threshold=3.0,
-            standardized_gate_consecutive=1,
-            cusum_recent_obs=20,
-        ),
+        # "R-BOCPD-PF-OGP": dict(type="ogp_bocpd"),
+        # "RBOCPD_half_STDGate": dict(
+        #     type="bocpd",
+        #     mode="restart",
+        #     use_discrepancy=False,
+        #     bocpd_use_discrepancy=True,
+        #     restart_impl="rolled_cusum_260324",
+        #     use_dual_restart=True,
+        #     use_cusum=True,
+        #     cusum_mode="standardized_gate",
+        #     hybrid_pf_sigma_mode="rolled",
+        #     standardized_gate_threshold=3,
+        #     standardized_gate_consecutive=1,
+        #     cusum_recent_obs=60,
+        # ),
+        # "RBOCPD_half_STDGate_particleGP": dict(
+        #     type="bocpd",
+        #     mode="restart",
+        #     use_discrepancy=False,
+        #     bocpd_use_discrepancy=True,
+        #     restart_impl="rolled_cusum_260324",
+        #     use_dual_restart=True,
+        #     use_cusum=True,
+        #     cusum_mode="standardized_gate",
+        #     hybrid_pf_sigma_mode="rolled",
+        #     standardized_gate_threshold=3,
+        #     standardized_gate_consecutive=1,
+        #     cusum_recent_obs=60,
+        #     particle_delta_mode="particle_gp_shared_hyper",
+        # ),
+        # "RBOCPD_half_STDGate_particleBasis": dict(
+        #     type="bocpd",
+        #     mode="restart",
+        #     use_discrepancy=False,
+        #     bocpd_use_discrepancy=True,
+        #     restart_impl="rolled_cusum_260324",
+        #     use_dual_restart=True,
+        #     use_cusum=True,
+        #     cusum_mode="standardized_gate",
+        #     hybrid_pf_sigma_mode="rolled",
+        #     standardized_gate_threshold=3,
+        #     standardized_gate_consecutive=1,
+        #     cusum_recent_obs=60,
+        #     particle_delta_mode="particle_basis",
+        #     particle_basis_kind="rbf",
+        #     particle_basis_num_features=12,
+        #     particle_basis_lengthscale=0.35,
+        # ),
         # "PF-OGP": dict(type="pf_ogp"),
         # "BOCPD-PF": dict(type="bocpd", mode="standard"),
         # "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
         # "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False),
-        # "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
+        "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
         # "BPC-80": dict(type="bpc"),
     }
     all_results = {}
