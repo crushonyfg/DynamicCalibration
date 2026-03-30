@@ -564,21 +564,21 @@ def main():
         }
     else:
         methods = {
-            "PF-OGP": dict(type="pf_ogp"),
-            "DA": dict(type="da"),
-            "BC": dict(type="bc"),
-            "BPC-80": dict(type="bpc"),
-            "BOCPD-BPC": dict(type="bpc_bocpd"),
-            "BOCPD-PF": dict(type="bocpd", mode="standard"),
-            "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
-            "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
+            # "PF-OGP": dict(type="pf_ogp"),
+            # "DA": dict(type="da"),
+            # "BC": dict(type="bc"),
+            # "BPC-80": dict(type="bpc"),
+            # "BOCPD-BPC": dict(type="bpc_bocpd"),
+            # "BOCPD-PF": dict(type="bocpd", mode="standard"),
+            # "R-BOCPD-PF-usediscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=True),
+            # "R-BOCPD-PF-nodiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=False),
             # "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True),
-            "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True, restart_impl="hybrid_260319", hybrid_partial_restart=False, hybrid_tau_delta=0.05, hybrid_tau_theta=0.05, hybrid_tau_full=0.05, hybrid_delta_share_rho=0.75, hybrid_pf_sigma_mode="fixed", hybrid_sigma_delta_alpha=1.0, hybrid_sigma_ema_beta=0.98, hybrid_sigma_min=1e-4, hybrid_sigma_max=10.0),
-            "RBOCPD_half_STDGate": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True, restart_impl="rolled_cusum_260324", use_dual_restart=False, use_cusum=True, cusum_mode="standardized_gate", standardized_gate_threshold=3.0, standardized_gate_consecutive=1, cusum_recent_obs=20, hybrid_tau_delta=0.05, hybrid_tau_theta=0.05, hybrid_tau_full=0.05, hybrid_delta_share_rho=0.75, hybrid_pf_sigma_mode="fixed", hybrid_sigma_delta_alpha=1.0, hybrid_sigma_ema_beta=0.98, hybrid_sigma_min=1e-4, hybrid_sigma_max=10.0),
-            "RBOCPD_half_STDGate_dual": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True, restart_impl="rolled_cusum_260324", use_dual_restart=True, use_cusum=True, cusum_mode="standardized_gate", standardized_gate_threshold=3.0, standardized_gate_consecutive=1, cusum_recent_obs=20, hybrid_tau_delta=0.05, hybrid_tau_theta=0.05, hybrid_tau_full=0.05, hybrid_delta_share_rho=0.75, hybrid_pf_sigma_mode="fixed", hybrid_sigma_delta_alpha=1.0, hybrid_sigma_ema_beta=0.98, hybrid_sigma_min=1e-4, hybrid_sigma_max=10.0),
-            # "RBOCPD_half_STDGate_particleGP": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True, restart_impl="rolled_cusum_260324", use_dual_restart=False, use_cusum=True, cusum_mode="standardized_gate", standardized_gate_threshold=3.0, standardized_gate_consecutive=1, cusum_recent_obs=20, hybrid_tau_delta=0.05, hybrid_tau_theta=0.05, particle_delta_mode="particle_gp_shared_hyper"),
+            # "R-BOCPD-PF-halfdiscrepancy": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True, restart_impl="hybrid_260319", hybrid_partial_restart=False, hybrid_tau_delta=0.05, hybrid_tau_theta=0.05, hybrid_tau_full=0.05, hybrid_delta_share_rho=0.75, hybrid_pf_sigma_mode="fixed", hybrid_sigma_delta_alpha=1.0, hybrid_sigma_ema_beta=0.98, hybrid_sigma_min=1e-4, hybrid_sigma_max=10.0),
+            # "RBOCPD_half_STDGate": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True, restart_impl="rolled_cusum_260324", use_dual_restart=False, use_cusum=True, cusum_mode="standardized_gate", standardized_gate_threshold=3.0, standardized_gate_consecutive=1, cusum_recent_obs=20, hybrid_tau_delta=0.05, hybrid_tau_theta=0.05, hybrid_tau_full=0.05, hybrid_delta_share_rho=0.75, hybrid_pf_sigma_mode="fixed", hybrid_sigma_delta_alpha=1.0, hybrid_sigma_ema_beta=0.98, hybrid_sigma_min=1e-4, hybrid_sigma_max=10.0),
+            # "RBOCPD_half_STDGate_dual": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True, restart_impl="rolled_cusum_260324", use_dual_restart=True, use_cusum=True, cusum_mode="standardized_gate", standardized_gate_threshold=3.0, standardized_gate_consecutive=1, cusum_recent_obs=20, hybrid_tau_delta=0.05, hybrid_tau_theta=0.05, hybrid_tau_full=0.05, hybrid_delta_share_rho=0.75, hybrid_pf_sigma_mode="fixed", hybrid_sigma_delta_alpha=1.0, hybrid_sigma_ema_beta=0.98, hybrid_sigma_min=1e-4, hybrid_sigma_max=10.0),
+            "RBOCPD_half_STDGate_particleGP": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True, restart_impl="rolled_cusum_260324", use_dual_restart=False, use_cusum=True, cusum_mode="standardized_gate", hybrid_pf_sigma_mode="fixed", standardized_gate_threshold=3.0, standardized_gate_consecutive=1, cusum_recent_obs=20, hybrid_tau_delta=0.05, hybrid_tau_theta=0.05, particle_delta_mode="particle_gp_shared_hyper"),
             # "RBOCPD_half_STDGate_particleBasis": dict(type="bocpd", mode="restart", use_discrepancy=False, bocpd_use_discrepancy=True, restart_impl="rolled_cusum_260324", use_dual_restart=False, use_cusum=True, cusum_mode="standardized_gate", standardized_gate_threshold=3.0, standardized_gate_consecutive=1, cusum_recent_obs=20, hybrid_tau_delta=0.05, hybrid_tau_theta=0.05, particle_delta_mode="particle_basis", particle_basis_kind="rbf", particle_basis_num_features=8, particle_basis_lengthscale=0.25, particle_basis_ridge=1e-2),
-            "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
+            # "R-BOCPD-PF-OGP": dict(type="bocpd", mode="restart"),
         }
 
     all_metrics, restart_mode_rows, restart_event_rows = [], [], []
